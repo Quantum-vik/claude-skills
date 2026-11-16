@@ -16,3 +16,7 @@ ln -s ~/WorkPersonal/claude-skills/lld-pdf ~/.claude/skills/lld-pdf
 ```
 
 Each skill's `SKILL.md` lists what it needs installed.
+
+## License
+
+[MIT](LICENSE)
