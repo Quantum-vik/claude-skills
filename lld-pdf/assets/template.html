@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>[Document title] — [MV-0000]</title>
+<style>
+  :root { --ink:#1b1f24; --muted:#57606a; --rule:#d0d7de; --accent:#0b5cad; --tint:#eef4fb; --warn:#9a6700; --warntint:#fff8e5; --code:#f5f7f9; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font-family: "Noto Sans", "Segoe UI", Helvetica, Arial, sans-serif; color: var(--ink); background: #fff; font-size: 9.3pt; line-height: 1.42; margin: 0; }
+  main { margin: 0 auto; }
+  h1 { font-size: 21pt; margin: 0 0 1.5mm; line-height: 1.15; }
+  h2 { font-size: 13.5pt; margin: 6mm 0 2.5mm; padding: 1.6mm 2.5mm; color: #fff; background: var(--accent); border-radius: 2px; break-after: avoid; }
+  h3 { font-size: 11.2pt; margin: 5mm 0 1.8mm; padding-bottom: 0.8mm; border-bottom: 1px solid var(--rule); color: var(--accent); break-after: avoid; }
+  h4 { font-size: 9.8pt; margin: 3.5mm 0 1.2mm; break-after: avoid; }
+  p { margin: 0 0 2mm; }
+  ul, ol { margin: 0 0 2.2mm; padding-left: 5.5mm; }
+  li { margin: 0 0 0.6mm; }
+  code { font-family: "JetBrains Mono", "DejaVu Sans Mono", Consolas, monospace; font-size: 7.9pt; background: var(--code); padding: 0 1px; border-radius: 2px; }
+  pre { font-family: "JetBrains Mono", "DejaVu Sans Mono", Consolas, monospace; font-size: 7.4pt; line-height: 1.36; background: var(--code); border: 1px solid var(--rule); border-radius: 3px; padding: 2.4mm 3mm; white-space: pre-wrap; word-break: break-word; margin: 0 0 2.6mm; }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  table { width: 100%; border-collapse: collapse; margin: 0.8mm 0 3mm; font-size: 8.1pt; line-height: 1.33; }
+  thead { display: table-header-group; }
+  tr { break-inside: avoid; }
+  th, td { border: 1px solid var(--rule); padding: 1.1mm 1.6mm; vertical-align: top; text-align: left; }
+  th { background: var(--tint); font-weight: 600; }
+  td code, th code { font-size: 7.4pt; }
+  .meta { font-size: 8.4pt; }
+  .meta td:first-child { width: 30mm; font-weight: 600; background: var(--tint); }
+  .sub { font-size: 11pt; color: var(--muted); margin: 0 0 4mm; }
+  .tag { display: inline-block; font-size: 7.4pt; border: 1px solid var(--rule); border-radius: 3px; padding: 0 1.2mm; color: var(--muted); margin-bottom: 2mm; }
+  .lead { font-size: 9.8pt; }
+  .note { border-left: 3px solid var(--accent); background: var(--tint); padding: 1.6mm 2.6mm; margin: 0 0 2.6mm; break-inside: avoid; }
+  .warn { border-left: 3px solid var(--warn); background: var(--warntint); padding: 1.6mm 2.6mm; margin: 0 0 2.6mm; break-inside: avoid; }
+  figure { margin: 1.5mm 0 3.5mm; break-inside: avoid; text-align: center; }
+  figcaption { font-size: 7.9pt; color: var(--muted); margin-top: 1.2mm; }
+  .dia { display: flex; justify-content: center; }
+  .dia svg { max-width: var(--w, 100%); max-height: var(--h, 225mm); width: auto; height: auto; }
+  .dia[style*="--h"] svg { height: var(--h); }
+  .dia[style*="--w"] svg { width: var(--w); }
+  .split { display: grid; grid-template-columns: var(--left, 70mm) 1fr; gap: 5mm; align-items: start; break-inside: avoid; }
+  .split figure { margin-top: 0; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 5mm; }
+  .toc { columns: 2; column-gap: 8mm; font-size: 8.6pt; margin-top: 1mm; }
+  .toc .part { font-weight: 700; color: var(--accent); margin: 1.6mm 0 0.6mm; break-after: avoid; }
+  .toc .row { display: flex; gap: 2mm; break-inside: avoid; line-height: 1.5; }
+  .toc .row a { color: var(--ink); text-decoration: none; }
+  .toc .row .dots { flex: 1; border-bottom: 1px dotted #9aa4ae; transform: translateY(-1.2mm); }
+  .toc .pg { min-width: 5mm; text-align: right; color: var(--muted); }
+  .uml-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2.6mm; margin: 1mm 0 3mm; }
+  .uml { border: 1px solid #8c959f; border-radius: 2px; font-size: 7.4pt; line-height: 1.32; break-inside: avoid; background: #fff; }
+  .uml .hd { background: var(--tint); border-bottom: 1px solid #8c959f; text-align: center; padding: 1mm; }
+  .uml .hd .st { display: block; font-style: italic; color: var(--muted); font-size: 6.8pt; }
+  .uml .hd b { font-size: 8.2pt; }
+  .uml.opt .hd { background: #f3f4f6; }
+  .uml ul { list-style: none; padding: 1.2mm 1.8mm; margin: 0; }
+  .uml li { margin: 0 0 0.4mm; font-family: "JetBrains Mono", "DejaVu Sans Mono", Consolas, monospace; font-size: 6.8pt; }
+</style>
+</head>
+<body>
+<main>
+
+<!-- COVER: tag, title, subtitle -->
+<div class="tag">[Engineering Tech Spec · Low-Level Design (LLD)]</div>
+<h1>[Document title]</h1>
+<div class="sub">[One-line subtitle: scope · what changes · what is delivered]</div>
+<!-- COVER: meta table (4 columns; last two rows span full width) -->
+<table class="meta">
+  <tr><td>Ticket</td><td>[MV-0000]</td><td style="width:26mm;font-weight:600;background:var(--tint)">Status</td><td>[Draft for review]</td></tr>
+  <tr><td>Repository</td><td>[Repo] · <code>[branch-name]</code></td><td style="font-weight:600;background:var(--tint)">Date</td><td>[DD Mon YYYY]</td></tr>
+  <tr><td>Author</td><td>[Author]</td><td style="font-weight:600;background:var(--tint)">Audience</td><td>[Backend, frontend, QA, reviewers]</td></tr>
+  <tr><td>LLD covers</td><td colspan="3">[Class diagrams, API endpoints, code logic, sequence diagrams, validation, delivery plan]</td></tr>
+  <tr><td>ERD covers</td><td colspan="3">[Tables, fields, keys, constraints and relationships]</td></tr>
+</table>
+
+<!-- CONTENTS: .part groups, .row entries; data-for must equal a heading id, page numbers are filled by build.py -->
+<h4 style="margin-top:2mm">Contents</h4>
+<div class="toc">
+  <div class="part">Part A — [Current state]</div>
+  <div class="row"><a href="#s1">1. [Summary]</a><span class="dots"></span><span class="pg" data-for="s1"></span></div>
+  <div class="row"><a href="#s2">2. [Second section]</a><span class="dots"></span><span class="pg" data-for="s2"></span></div>
+  <div class="part">Part B — [Proposed design]</div>
+  <div class="row"><a href="#s3">3. [Third section]</a><span class="dots"></span><span class="pg" data-for="s3"></span></div>
+</div>
+
+<!-- PART BAR: h2 renders as a blue bar -->
+<h2>Part A — [Current state]</h2>
+
+<!-- SECTION: h3 with id matching the contents row -->
+<h3 id="s1">1. [Summary]</h3>
+<!-- LEAD paragraph -->
+<p class="lead">[Lead paragraph: what this is and why the document exists.]</p>
+<!-- TABLE: thead repeats across pages -->
+<table>
+<thead><tr><th>[Column]</th><th>[Role]</th><th>[Size]</th></tr></thead>
+<tbody>
+<tr><td><code>[name]</code></td><td>[What it does]</td><td>[value]</td></tr>
+<tr><td><code>[name]</code></td><td>[What it does]</td><td>[value]</td></tr>
+</tbody></table>
+<!-- FIGURE: .dia placeholder is replaced by the rendered diagram; optional style="--w:120mm;--h:80mm" -->
+<figure>
+<div class="dia" data-src="a1_example.mmd"></div>
+<figcaption>Figure A1 — [Caption]</figcaption>
+</figure>
+<!-- NOTE (blue) and WARN (amber) callouts -->
+<div class="note"><b>[Note title.]</b> [Supporting detail the reader should keep in mind.]</div>
+<div class="warn"><b>[Warning title.]</b> [A risk, gap or constraint.]</div>
+<!-- CODE block -->
+<pre><code>def [function](arg):
+    [body]
+    return [value]</code></pre>
+
+<h3 id="s2">2. [Second section]</h3>
+<!-- FIGURE with Graphviz ERD -->
+<figure>
+<div class="dia" data-src="a2_example.dot"></div>
+<figcaption>Figure A2 — [Entity-relationship diagram]</figcaption>
+</figure>
+
+<h2>Part B — [Proposed design]</h2>
+
+<h3 id="s3">3. [Third section]</h3>
+<!-- TWO: two equal columns -->
+<div class="two">
+<div>
+<h4>[Left heading]</h4>
+<ol>
+<li>[Step one.]</li>
+<li>[Step two.]</li>
+</ol>
+</div>
+<div>
+<h4>[Right heading]</h4>
+<ul>
+<li>[Point one.]</li>
+<li>[Point two.]</li>
+</ul>
+</div>
+</div>
+<!-- SPLIT: figure left (width via --left), text or table right -->
+<div class="split" style="--left:84mm">
+<figure>
+<div class="dia" data-src="a1_example.mmd"></div>
+<figcaption>Figure B1 — [Caption]</figcaption>
+</figure>
+<table>
+<thead><tr><th>[Concern]</th><th>[Today]</th><th>[After]</th></tr></thead>
+<tbody>
+<tr><td>[Item]</td><td>[Before]</td><td>[After]</td></tr>
+</tbody></table>
+</div>
+<!-- UML-GRID: class boxes, 3 per row; .opt greys the header -->
+<div class="uml-grid">
+  <div class="uml"><div class="hd"><span class="st">«Protocol»</span><b>[ClassName]</b></div><ul>
+    <li>+[method](arg) [Type]</li><li>+[field]: [Type]</li></ul></div>
+  <div class="uml opt"><div class="hd"><span class="st">«Protocol, optional»</span><b>[OtherClass]</b></div><ul>
+    <li>+[method](arg) [Type]</li></ul></div>
+</div>
+
+</main>
+</body>
+</html>

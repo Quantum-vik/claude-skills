@@ -1,0 +1,6 @@
+flowchart LR
+  UI["Client"] -->|"POST /api/[resource]"| API["View"]
+  API --> BLL["BLL"]
+  BLL --> DB[("Database")]
+  BLL -->|"enqueue"| Q["Celery task"]
+  Q --> EXT["External service"]

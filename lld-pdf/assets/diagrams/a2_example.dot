@@ -1,0 +1,12 @@
+digraph ERD {
+  graph [rankdir=LR, nodesep=0.35, ranksep=0.7, fontname="Noto Sans", bgcolor="white", pad=0.15];
+  node  [shape=plain, fontname="Noto Sans", fontsize=10];
+  edge  [fontname="Noto Sans", fontsize=9, color="#555555", dir=both, arrowtail=crow, arrowhead=tee];
+
+  P [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4"><TR><TD BGCOLOR="#e9ecef" COLSPAN="3"><B>Existing.Parent</B></TD></TR><TR><TD ALIGN="LEFT">id</TD><TD ALIGN="LEFT">uuid</TD><TD>PK</TD></TR></TABLE>>];
+  C [label=<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4"><TR><TD BGCOLOR="#dbe8f7" COLSPAN="3"><B>New_child</B></TD></TR>
+    <TR><TD ALIGN="LEFT">id</TD><TD ALIGN="LEFT">bigint</TD><TD>PK</TD></TR>
+    <TR><TD ALIGN="LEFT">parent_id</TD><TD ALIGN="LEFT">uuid</TD><TD>FK, CASCADE</TD></TR>
+    <TR><TD ALIGN="LEFT">name</TD><TD ALIGN="LEFT">varchar(255)</TD><TD>UNIQUE</TD></TR></TABLE>>];
+  P -> C [label="1 : N"];
+}
