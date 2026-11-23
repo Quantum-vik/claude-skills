@@ -5,6 +5,7 @@ Personal [Claude Code](https://docs.claude.com/en/docs/claude-code) skills. Each
 | Skill | What it does |
 |---|---|
 | [`lld-pdf`](lld-pdf/) | Builds an A4 PDF in a fixed LLD / tech-spec format (cover table, contents with page numbers, Part bars, numbered sections, Mermaid and Graphviz figures, page footer) from one HTML source |
+| [`api-contract`](api-contract/) | Writes an API contract in a fixed Markdown format (conventions, shared shapes, endpoint summary, one section per endpoint with real captured requests and responses, jobs and events, end-to-end flows, edge cases, FE/BE mismatches, open questions) from the code, with a checker for missing sections, placeholders and leaked secrets |
 
 ## Install
 
@@ -13,6 +14,7 @@ Link a skill into your skills folder:
 ```sh
 git clone https://github.com/Quantum-vik/claude-skills.git ~/WorkPersonal/claude-skills
 ln -s ~/WorkPersonal/claude-skills/lld-pdf ~/.claude/skills/lld-pdf
+ln -s ~/WorkPersonal/claude-skills/api-contract ~/.claude/skills/api-contract
 ```
 
 Each skill's `SKILL.md` lists what it needs installed.
