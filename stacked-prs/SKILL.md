@@ -1,6 +1,6 @@
 ---
 name: stacked-prs
-description: Split one large change (a staged index, a branch or a commit) into a stack of small dependent PRs, each under a line cap, and keep the stack healthy afterwards. Plans the layers, checks Python import order and dependency cycles between PRs, writes the stack document (map, per-PR cards, file-to-PR index, change procedure), cuts the branches without touching the working tree, verifies each branch, and merges fixes upward. Use when asked for stacked PRs, to split a big PR or feature into smaller PRs, to plan PRs under N lines, or to fix, restack or document an existing stack.
+description: Split one large change (a staged index, a branch or a commit) into a stack of small dependent PRs, each under a line cap, and keep the stack healthy afterwards. Plans the layers, checks Python import order and dependency cycles between PRs, writes the stack document (map, per-PR cards, file-to-PR index, change procedure), cuts the branches without touching the working tree, verifies each branch, merges fixes upward, and tracks the stack after the cut (commits per PR, branches needing sync, drift from the plan, review decisions, unresolved review threads, CI). Use when asked for stacked PRs, to split a big PR or feature into smaller PRs, to plan PRs under N lines, or to fix, restack, document or check the status of an existing stack, or to handle review comments on stacked PRs.
 ---
 
 # Stacked PRs
@@ -19,7 +19,7 @@ Kit (paths relative to this skill's folder, `~/.claude/skills/stacked-prs/`):
 
 | File | Role |
 |---|---|
-| `scripts/stack.py` | `snapshot`, `init`, `check`, `doc [--prs]`, `cut`, `verify`, `sync` (run with `--help`) |
+| `scripts/stack.py` | `snapshot`, `init`, `check`, `doc [--prs]`, `status [--prs]`, `cut`, `verify`, `sync` (run with `--help`) |
 | `reference/plan-format.md` | The plan file (`.stack/stack.toml`) and how paths match |
 | `reference/fixing.md` | How to resolve order problems, cycles, migrations and over-cap PRs |
 
@@ -68,9 +68,11 @@ Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `
    Fill `purpose` and `check` per PR and `stack_type` / `notes` in the plan (they are rendered into the document),
    then regenerate; never hand-edit the generated file, or the next regeneration loses it. Put it where the repo
    keeps design docs, or ask. Done when no `TODO` remains. After the PRs are opened, regenerate with `--prs` to
-   fill the PR numbers and states (needs `gh`).
-6. **Cut (after approval).** `stack.py cut` creates the N branches from the fork point with one commit each and
-   confirms the top branch equals the source. It refuses if a branch already exists.
+   add PR numbers, review decisions, unresolved review threads and CI (needs `gh`; read-only).
+6. **Cut (after approval).** `stack.py cut` creates the N branches from the fork point with one commit each,
+   confirms the top branch equals the source, and records the cut (date, source, fork, each branch's first commit)
+   in `cut.json` next to the plan. It refuses if a branch already exists. From now on **the branches are the source
+   of truth**: `check`, `doc` and `status` read them, not the snapshot, so changes made after the cut show up.
 7. **Verify.** `stack.py verify --cmd "<build/test command>"` runs the command in a fresh worktree of each branch
    (`--from N` to start later). For review slices, verify the top branch at least. Untracked config a command
    needs must be copied in by the command itself.
@@ -80,15 +82,40 @@ Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `
 
 ## Picking up an existing stack (new session)
 
-Read the stack document first, not the code: *Read me first*, *Starting state*, then the card of the PR you are
-working on. Its *what changed* table says which symbols changed and where; open a file only for logic you need,
-and skip code marked `moved … unchanged`. Confirm it is current: the source sha in the header must match the plan's
-`source`, and if branches exist the starting state must say the top branch matches. Otherwise regenerate it.
+1. `stack.py status --prs` first: one screen with, per PR, commits since the cut, whether it is behind the PR
+   below, drift, PR state, review decision, unresolved threads and CI, followed by the **next steps**.
+2. Then the stack document: *Read me first*, *Starting state*, *Next steps*, and the card of the PR you are working
+   on. Its *what changed* table says which symbols changed and where (built from that PR's branch once cut); open
+   a file only for logic you need, and skip code marked `moved … unchanged`. Regenerate the document if any branch
+   moved after its timestamp.
+
+## What is tracked after the cut
+
+| Tracked | Where it comes from | Shown in |
+|---|---|---|
+| Commits made on each PR since the cut (merges from `sync` left out) | `git log <cut commit>..<branch> ^<branch below>` | card *Commits since cut*, map *Since cut*, `status` |
+| A PR missing fixes from the PR below (needs `sync`) | commits on the branch below not in this branch | map *In sync*, card *Branch head*, next steps |
+| Drift: a branch changes a file the plan gives to another PR, or a file not in the plan | the branch's own diff against the plan | card *Drift*, file index *Changed in*, next steps |
+| What each PR really changes now | the branch's three-dot diff (same as GitHub's PR diff) | card *what changed* table and sizes |
+| PR number, state, draft, review decision, CI | `gh pr list --json …` | map, card *Review*, `status --prs` |
+| Unresolved review threads (file:line, reviewer, first line, link) | `gh api graphql` reviewThreads | card *Unresolved review threads*, `status --prs` |
+
+## Handling review comments
+
+1. `stack.py status --prs` → which PRs have open threads; the card lists each thread with file:line and a link.
+2. The file → PR index tells whether the commented file really belongs to that PR; if the fix belongs to a lower
+   PR, fix it there instead (the comment's PR receives it through `sync`).
+3. Fix on that PR's branch (a temporary `git worktree add` keeps the user's checkout untouched), commit in the
+   repo's subject format, `stack.py sync <k>`, run that PR's check.
+4. `stack.py doc --prs` to refresh the document; then push the changed branches and reply to or resolve the
+   threads, **only with the user's go**.
 
 ## Keeping the stack healthy
 
 - **Change in PR k:** commit on branch k, then `stack.py sync k` merges k into k+1, k+1 into k+2, … to the top.
   It merges, never rebases, and stops on a conflict with the worktree path to resolve in.
+- **Drift reported:** either move the path in the plan to the PR that now changes it, or record in `notes` why
+  it is fine (for example a one-line fix carried in a later PR). Regenerate.
 - **Merging:** bottom-up. With "delete branch on merge", GitHub retargets the next PR to the base automatically.
   Use merge commits; a squash merge rewrites the layer and every PR above it then shows conflicts.
 - **New file:** add it to the plan under the first PR that needs it, `check`, commit it on that branch, `sync`.

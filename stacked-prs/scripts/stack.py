@@ -6,7 +6,9 @@ Subcommands (run from the repo root; the plan defaults to .stack/stack.toml):
   init                  write a plan skeleton and list every changed file with its size
   check                 unassigned files, PR sizes against the cap, Python import order problems and cycles
   doc [--out F] [--prs] write the stack document: session guide, state, map, per-PR cards with a per-file
-                        change summary, dependency reasons, problems, file index, change procedure
+                        change summary, dependency reasons, commits since cut, drift, reviews, file index
+  status [--prs]        one-screen health of the stack (sync needed, commits since cut, drift, reviews, CI)
+                        and the next steps
   cut                   create the PR branches with plumbing only; your checkout and working tree are untouched
   verify --cmd CMD      run CMD in a temporary worktree of each branch and report pass/fail
   sync N                merge branch N into N+1, N+1 into N+2, ... up to the top (stops on a conflict)
@@ -52,16 +54,18 @@ class Plan:
         self.notes = cfg.get("notes", "")
         for n, pr in enumerate(self.prs, 1):
             pr["n"], pr["branch"] = n, f"{self.prefix}{n:02d}-{pr['name']}"
-        self.source_sha = git("rev-parse", self.source).strip()
-        self.fork = git("merge-base", self.base, self.source).strip()
-        self.changed = {}  # path -> (status, added, deleted, binary)
-        stats = {}
-        for line in git("diff", "--numstat", "--no-renames", self.fork, self.source).splitlines():
-            a, d, p = line.split("\t", 2)
-            stats[p] = (int(a) if a != "-" else 0, int(d) if d != "-" else 0, a == "-")
-        for line in git("diff", "--name-status", "--no-renames", self.fork, self.source).splitlines():
-            st, p = line.split("\t", 1)
-            self.changed[p] = (st[0], *stats.get(p, (0, 0, False)))
+        self.cut_path = os.path.join(os.path.dirname(path) or ".", "cut.json")
+        self.cut = None
+        if os.path.exists(self.cut_path):
+            with open(self.cut_path) as f:
+                self.cut = json.load(f)
+        self.use_ref(self.source)
+
+    def use_ref(self, ref):
+        """Describe the change as fork point -> ref (the snapshot before cutting, the top branch after)."""
+        self.source_sha = git("rev-parse", ref).strip()
+        self.fork = self.cut["fork"] if self.cut else git("merge-base", self.base, self.source_sha).strip()
+        self.changed = diff_stats(self.fork, self.source_sha)
 
     def pr_of(self, path):
         """Longest matching pattern wins; None = excluded, 0 = unassigned."""
@@ -89,6 +93,24 @@ class Plan:
 
     def base_of(self, pr):
         return self.base if pr["n"] == 1 else self.prs[pr["n"] - 2]["branch"]
+
+
+def diff_stats(a, b):
+    """path -> (status letter, added, deleted, binary) for the diff a..b."""
+    stats, out = {}, {}
+    for line in git("diff", "--numstat", "--no-renames", a, b).splitlines():
+        x, y, p = line.split("\t", 2)
+        stats[p] = (int(x) if x != "-" else 0, int(y) if y != "-" else 0, x == "-")
+    for line in git("diff", "--name-status", "--no-renames", a, b).splitlines():
+        st, p = line.split("\t", 1)
+        out[p] = (st[0], *stats.get(p, (0, 0, False)))
+    return out
+
+
+def size_of(stats):
+    """(counted lines in kept files, lines in deleted files)."""
+    return (sum(a + d for st, a, d, _ in stats.values() if st != "D"),
+            sum(d for st, _, d, _ in stats.values() if st == "D"))
 
 
 def read_blobs(rev, paths):
@@ -334,12 +356,12 @@ def where(s):
     return f"L{s['start']}–{s['end']}" if s["end"] != s["start"] else f"L{s['start']}"
 
 
-def describe(plan, old_src, new_src):
+def describe(changed, old_src, new_src):
     """Per changed file: list of markdown bullet strings describing the change."""
     summary = {}
     added_by_name, removed_by_name = collections.defaultdict(list), collections.defaultdict(list)
     parsed = {}
-    for p, (st, a, d, binary) in plan.changed.items():
+    for p, (st, a, d, binary) in changed.items():
         if binary:
             summary[p] = ["binary file"]
             continue
@@ -354,7 +376,7 @@ def describe(plan, old_src, new_src):
             for name in set(osyms) - set(nsyms):
                 if osyms[name]["kind"] != "const":
                     removed_by_name[name].append(p)
-    for p, (st, a, d, binary) in plan.changed.items():
+    for p, (st, a, d, binary) in changed.items():
         if binary:
             continue
         old, new = old_src.get(p), new_src.get(p)
@@ -419,16 +441,123 @@ def describe(plan, old_src, new_src):
     return summary
 
 
-def pr_numbers(plan):
+def ref_of(branch):
+    for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+        sha = git("rev-parse", "--verify", "--quiet", ref, check=False).strip()
+        if sha:
+            return sha
+    return ""
+
+
+def branch_state(plan):
+    """Per PR number: head, layer range, own commits since cut, commits it is missing from below, drift.
+
+    Empty dict when no branch of the plan exists yet. A layer is merge-base(below, head)..head, the same
+    three-dot diff GitHub shows for the PR."""
+    heads = {pr["n"]: ref_of(pr["branch"]) for pr in plan.prs}
+    if not any(heads.values()):
+        return {}
+    cut = (plan.cut or {}).get("branches", {})
+    out, below = {}, plan.base
+    for pr in plan.prs:
+        n, head = pr["n"], heads[pr["n"]]
+        info = dict(head=head, layer=None, stats={}, commits=None, behind=0, drift=[])
+        if head:
+            start = git("merge-base", below, head).strip()
+            info["layer"] = (start, head)
+            info["behind"] = int(git("rev-list", "--count", f"{head}..{below}").strip())
+            if pr["branch"] in cut:
+                info["commits"] = []
+                log = git("log", "--no-merges", "--date=short", "--format=%x1e%h%x09%ad%x09%s", "--name-only",
+                          f"{cut[pr['branch']]}..{head}", f"^{below}")
+                for chunk in log.split("\x1e")[1:]:
+                    first, *files = [x for x in chunk.splitlines() if x.strip()]
+                    sha, date, subject = first.split("\t", 2)
+                    info["commits"].append(dict(sha=sha, date=date, subject=subject, files=files))
+            info["stats"] = diff_stats(start, head)
+            info["drift"] = sorted((p, plan.pr_of(p)) for p in info["stats"] if plan.pr_of(p) != n)
+            below = head
+        out[n] = info
+    return out
+
+
+THREADS_QUERY = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){"
+                 "reviewThreads(first:100){nodes{isResolved isOutdated path line "
+                 "comments(first:1){nodes{author{login} body url}}}}}}}")
+
+
+def github(plan):
+    """Per PR number: number, url, state, reviewDecision, isDraft, baseRefName, ci (pass, fail, pending) and
+    unresolved review threads. Read-only; empty when gh is missing or not logged in."""
     if shutil.which("gh") is None:
         return {}
+    repo = subprocess.run(["gh", "repo", "view", "--json", "owner,name"], capture_output=True, text=True)
+    if repo.returncode:
+        return {}
+    repo = json.loads(repo.stdout)
     out = {}
     for pr in plan.prs:
-        r = subprocess.run(["gh", "pr", "list", "--head", pr["branch"], "--state", "all", "--json", "number,state,url"],
+        r = subprocess.run(["gh", "pr", "list", "--head", pr["branch"], "--state", "all", "--limit", "1", "--json",
+                            "number,url,state,reviewDecision,isDraft,baseRefName,statusCheckRollup"],
                            capture_output=True, text=True)
-        if r.returncode == 0 and r.stdout.strip() not in ("", "[]"):
-            out[pr["n"]] = json.loads(r.stdout)[0]
+        if r.returncode or r.stdout.strip() in ("", "[]"):
+            continue
+        d = json.loads(r.stdout)[0]
+        ci = collections.Counter()
+        for c in d.pop("statusCheckRollup") or []:
+            v = (c.get("conclusion") or c.get("state") or "").upper()
+            ci["pass" if v in ("SUCCESS", "NEUTRAL", "SKIPPED") else "fail" if v in (
+                "FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE") else "pending"] += 1
+        d["ci"] = ci
+        t = subprocess.run(["gh", "api", "graphql", "-f", f"query={THREADS_QUERY}", "-F", f"o={repo['owner']['login']}",
+                            "-F", f"r={repo['name']}", "-F", f"n={d['number']}"], capture_output=True, text=True)
+        d["threads"] = []
+        if t.returncode == 0:
+            nodes = json.loads(t.stdout)["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+            for node in nodes:
+                if node["isResolved"] or not node["comments"]["nodes"]:
+                    continue
+                c = node["comments"]["nodes"][0]
+                body = " ".join(c["body"].split())
+                d["threads"].append(dict(path=node["path"], line=node["line"], outdated=node["isOutdated"],
+                                         author=(c.get("author") or {}).get("login", "?"), url=c["url"],
+                                         body=body[:140] + ("…" if len(body) > 140 else "")))
+        out[pr["n"]] = d
     return out
+
+
+def ci_text(ci):
+    if not ci:
+        return "—"
+    return "fail" if ci["fail"] else "pending" if ci["pending"] else "pass"
+
+
+def next_steps(plan, state, gh):
+    steps = []
+    if not state:
+        return ["Nothing is cut yet: `check` until clean, `doc`, then `cut` after approval."]
+    for pr in plan.prs:
+        n, s, g = pr["n"], state[pr["n"]], gh.get(pr["n"], {})
+        if not s["head"]:
+            steps.append(f"PR {n:02d}: branch not found locally or on origin (merged and deleted?).")
+            continue
+        if s["behind"] and n > 1:
+            steps.append(f"PR {n:02d}: missing {s['behind']} commit(s) from PR {n - 1:02d} → `sync {n - 1}`.")
+        elif s["behind"]:
+            steps.append(f"PR 01: base `{plan.base}` has {s['behind']} new commit(s); merge it into branch 01 only "
+                         "if needed, then `sync 1`.")
+        for path, owner in s["drift"]:
+            where_ = f"PR {owner:02d}" if owner else ("no PR (excluded)" if owner is None else "no PR (unassigned)")
+            steps.append(f"PR {n:02d}: changes `{path}`, which the plan gives to {where_} → move it in the plan or "
+                         "accept it in `notes`.")
+        if g.get("threads"):
+            steps.append(f"PR {n:02d}: {len(g['threads'])} unresolved review thread(s) → fix on branch {n:02d}, "
+                         f"commit, `sync {n}`.")
+        if g.get("reviewDecision") == "CHANGES_REQUESTED":
+            steps.append(f"PR {n:02d}: changes requested.")
+        if g.get("ci", {}).get("fail"):
+            steps.append(f"PR {n:02d}: CI failing.")
+    return steps or ["Nothing to do: every branch is in sync, no drift, no open review threads."]
 
 
 # ---------- subcommands ----------
@@ -466,6 +595,10 @@ def cmd_init(args):
 
 def cmd_check(args):
     plan = Plan(args.plan)
+    state = branch_state(plan)
+    if state and state[plan.prs[-1]["n"]]["head"]:
+        plan.use_ref(state[plan.prs[-1]["n"]]["head"])
+        print(f"checking the top branch {plan.prs[-1]['branch']} (branches are cut)")
     excluded = [p for p in plan.changed if plan.pr_of(p) is None]
     if excluded:
         print("excluded:", *excluded, sep="\n  ")
@@ -482,12 +615,27 @@ def cmd_check(args):
 
 def cmd_doc(args):
     plan = Plan(args.plan)
+    state = branch_state(plan)
+    top = plan.prs[-1] if plan.prs else None
+    snapshot_sha = plan.source_sha
+    if state and top and state[top["n"]]["head"]:
+        plan.use_ref(state[top["n"]]["head"])  # after cutting, the branches are the source of truth
     old, new = trees(plan)
     edges = constraints(plan, old, new)
     found = problems(plan, edges)
-    paths = list(plan.changed)
-    changes = describe(plan, read_blobs(plan.fork, paths), read_blobs(plan.source, paths))
-    numbers = pr_numbers(plan) if args.prs else {}
+    gh = github(plan) if args.prs else {}
+
+    # per PR: the files and stats it really carries (its branch layer once cut, the plan before)
+    layer_stats, changes = {}, {}
+    for pr in plan.prs:
+        n, s = pr["n"], state.get(pr["n"])
+        if s and s["layer"]:
+            stats, (a, b) = s["stats"], s["layer"]
+        else:
+            stats, (a, b) = {p: plan.changed[p] for p in plan.files_of(n)}, (plan.fork, plan.source_sha)
+        layer_stats[n] = stats
+        changes[n] = describe(stats, read_blobs(a, stats), read_blobs(b, stats))
+
     needs = collections.defaultdict(lambda: collections.defaultdict(set))  # pr -> other pr -> {symbol}
     used_by = collections.defaultdict(set)
     for a, b, what, _ in edges:
@@ -495,19 +643,20 @@ def cmd_doc(args):
         if pa and pb and pa != pb:
             needs[pb][pa].add(f"`{what}`")
             used_by[pa].add(pb)
-    heads = {pr["n"]: git("rev-parse", "--verify", "--quiet", f"refs/heads/{pr['branch']}", check=False).strip()
-             for pr in plan.prs}
-    top = plan.prs[-1] if plan.prs else None
-    top_matches = bool(top and heads[top["n"]]) and subprocess.run(
-        ["git", "diff", "--quiet", heads[top["n"]], plan.source_sha, "--", ".", *[f":!{x}" for x in plan.exclude]]
-    ).returncode == 0
-    total_kept = sum(plan.size(pr["n"])[0] for pr in plan.prs)
-    total_deleted = sum(plan.size(pr["n"])[1] for pr in plan.prs)
+    total_kept = sum(size_of(layer_stats[pr["n"]])[0] for pr in plan.prs)
+    total_deleted = sum(size_of(layer_stats[pr["n"]])[1] for pr in plan.prs)
     run = f"python3 {SELF} --plan {plan.path}"
+    cut_branches = sum(1 for s in state.values() if s["head"])
+    if state:
+        mode = (f"**branches** (cut {plan.cut['date']} from `{plan.cut['source'][:12]}`); every card below is "
+                "built from its branch" if plan.cut else "**branches** (no `cut.json`: commits since cut unknown)")
+    else:
+        mode = "**plan** (nothing cut yet); cards are built from the source and the plan"
 
     L = [f"# Stacked PRs: {plan.prefix.rstrip('-/')}", "",
-         f"_Generated {datetime.date.today()} by `stack.py doc` from source `{plan.source_sha[:12]}` against "
-         f"`{plan.base}` (fork point `{plan.fork[:12]}`). Regenerate after any change: `{run} doc --out {args.out}`._",
+         f"_Generated {datetime.datetime.now():%Y-%m-%d %H:%M} by `stack.py doc` from `{plan.source_sha[:12]}` "
+         f"against `{plan.base}` (fork point `{plan.fork[:12]}`). Regenerate after any change: "
+         f"`{run} doc{' --prs' if args.prs else ''} --out {args.out}`._",
          "", "## Read me first", "",
          "- **What this is:** one large change split into the PRs below. Each PR is based on the one above it in the "
          "map; each branch contains every PR below it, so the **top branch is the whole change**.",
@@ -519,87 +668,144 @@ def cmd_doc(args):
          "- **Find the owner of a file:** [File → PR index](#file--pr-index). **Why a PR must land after another:** "
          "the `Lands after` line on its card names the exact imports; `⚠` marks a dependency on a later PR, which is an "
          "order problem.",
-         "- **Before trusting it:** the source must still be `" + plan.source_sha[:12] + "`. If branches exist and "
-         "someone committed on them, regenerate first.",
+         "- **After the branches are cut they are the source of truth.** Each card then shows the commits made on that "
+         "branch since the cut, files it touches that the plan gives to another PR (drift), and, with `--prs`, the "
+         "review decision, unresolved review threads and CI.",
+         f"- **Is this file current?** Run `{run} status`: it prints the same health data live and the next steps. "
+         "Regenerate this file whenever a branch moved since the timestamp above.",
          f"- **Making a change:** see [Making a change](#making-a-change). Plan file: `{plan.path}`.", "",
          "## Starting state", "",
          "| Item | Value |", "|---|---|",
+         f"| Mode | {mode} |",
          f"| Base (PR 01 targets) | `{plan.base}` |",
          f"| Fork point | `{plan.fork[:12]}` |",
-         f"| Source (whole change) | `{plan.source}` → `{plan.source_sha[:12]}` |",
-         f"| Changed files | {len(plan.changed)} (+{sum(v[1] for v in plan.changed.values())} / "
-         f"−{sum(v[2] for v in plan.changed.values())}) |",
+         f"| Planned source | `{plan.source}` → `{snapshot_sha[:12]}` |",
+         f"| Whole change now | `{plan.source_sha[:12]}`: {len(plan.changed)} files "
+         f"(+{sum(v[1] for v in plan.changed.values())} / −{sum(v[2] for v in plan.changed.values())}) |",
          f"| In the stack | {len(plan.prs)} PRs, {total_kept} counted lines, {total_deleted} lines in deleted files |",
          f"| Cap | {plan.cap} lines per PR (added + deleted lines in kept files; deleted files not counted) |",
-         f"| Branches cut | {sum(1 for h in heads.values() if h)} of {len(plan.prs)} exist locally"
-         + (f"; top branch {'matches' if top_matches else '**differs from**'} the source" if any(heads.values()) else "")
-         + " |",
+         f"| Branches | {cut_branches} of {len(plan.prs)} found (local or origin) |",
          f"| Stack type | {plan.stack_type or '**TODO** (review slices or runnable, and why)'} |",
          f"| Excluded from the stack | {short(f'`{p}`' for p in plan.changed if plan.pr_of(p) is None) or 'none'} |",
+         "", "## Next steps", "", *(f"- {x}" for x in next_steps(plan, state, gh)),
          "", "## Branch tree", "", "```", plan.base]
     for i, pr in enumerate(plan.prs):
-        L.append(f"{'     ' * i} └── {pr['branch']}   PR {pr['n']:02d}" + (f" #{numbers[pr['n']]['number']}"
-                                                                           if pr["n"] in numbers else ""))
+        L.append(f"{'     ' * i} └── {pr['branch']}   PR {pr['n']:02d}"
+                 + (f" #{gh[pr['n']]['number']}" if pr["n"] in gh else ""))
     L += ["```", "", "Merge bottom-up with merge commits (not squash). With \"delete branch on merge\", GitHub retargets "
           "the next PR to the base by itself.", "", "## Stack map", "",
-          "| # | PR | Branch | Base | Title | Lines | Deleted | Files | Lands after |",
-          "|---|---|---|---|---|---|---|---|---|"]
+          "| # | PR | Branch | Title | Lines | Deleted | Lands after | Since cut | In sync | Review | CI |",
+          "|---|---|---|---|---|---|---|---|---|---|---|"]
     for pr in plan.prs:
-        n = pr["n"]
-        counted, deleted = plan.size(n)
-        num = f"[#{numbers[n]['number']}]({numbers[n]['url']}) {numbers[n]['state'].lower()}" if n in numbers else "—"
-        L.append(f"| {n:02d} | {num} | `{pr['branch']}` | `{plan.base_of(pr)}` | {pr['title']} | "
-                 f"{counted}{' ⚠' if counted > plan.cap else ''} | {deleted} | {len(plan.files_of(n))} | "
-                 f"{', '.join(f'⚠{d:02d}' if d > n else f'{d:02d}' for d in sorted(needs[n])) or '—'} |")
+        n, s, g = pr["n"], state.get(pr["n"]), gh.get(pr["n"])
+        counted, deleted = size_of(layer_stats[n])
+        num = f"[#{g['number']}]({g['url']}) {g['state'].lower()}" if g else "—"
+        since = "—" if not s or s["commits"] is None else f"{len(s['commits'])} commit(s)"
+        sync = "—" if not s or not s["head"] else ("✓" if not s["behind"] else f"behind {s['behind']}")
+        review = "—" if not g else f"{(g.get('reviewDecision') or 'none').lower().replace('_', ' ')}, " \
+                                   f"{len(g['threads'])} open thread(s)"
+        L.append(f"| {n:02d} | {num} | `{pr['branch']}` | {pr['title']} | "
+                 f"{counted}{' ⚠' if counted > plan.cap else ''} | {deleted} | "
+                 f"{', '.join(f'⚠{d:02d}' if d > n else f'{d:02d}' for d in sorted(needs[n])) or '—'} | "
+                 f"{since} | {sync} | {review} | {ci_text(g.get('ci')) if g else '—'} |")
     L += ["", "## Problems and decisions", ""]
-    over = [pr for pr in plan.prs if plan.size(pr["n"])[0] > plan.cap]
+    over = [pr for pr in plan.prs if size_of(layer_stats[pr["n"]])[0] > plan.cap]
     if over:
-        L.append("Over the cap: " + ", ".join(f"PR {pr['n']:02d} ({plan.size(pr['n'])[0]})" for pr in over) + ".")
-        L.append("")
+        L += ["Over the cap: " + ", ".join(f"PR {pr['n']:02d} ({size_of(layer_stats[pr['n']])[0]})" for pr in over)
+              + ".", ""]
     L += (["Open problems from `check`:", "", "```", *found, "```"] if found else ["`check` is clean."])
     L += ["", plan.notes or "**TODO:** accepted exceptions and why, decisions, open checks.", "", "## PRs", ""]
     for pr in plan.prs:
-        n = pr["n"]
-        counted, deleted = plan.size(n)
+        n, s, g = pr["n"], state.get(pr["n"]), gh.get(pr["n"])
+        counted, deleted = size_of(layer_stats[n])
         need_txt = "; ".join(f"{'⚠ ' if d > n else ''}PR {d:02d} for {short(sorted(syms), 6)}"
                              for d, syms in sorted(needs[n].items()))
         L += [f"### {n:02d} · {pr['name']}", "",
               f"- **Title:** {pr['title']}",
               f"- **Branch:** `{pr['branch']}` → base `{plan.base_of(pr)}`"
-              + (f" · PR [#{numbers[n]['number']}]({numbers[n]['url']})" if n in numbers else ""),
+              + (f" · PR [#{g['number']}]({g['url']}) {g['state'].lower()}{' (draft)' if g.get('isDraft') else ''}"
+                 if g else ""),
               f"- **Size:** {counted} lines{' (over cap)' if counted > plan.cap else ''}, {deleted} in deleted files, "
-              f"{len(plan.files_of(n))} files",
+              f"{len(layer_stats[n])} files",
               f"- **Purpose:** {pr.get('purpose') or '**TODO**'}",
               f"- **Check:** {pr.get('check') or '**TODO**'}",
               f"- **Lands after:** {need_txt or 'no other PR in the stack'}"
               + (" (⚠ = a later PR: an order problem, see Problems)" if any(d > n for d in needs[n]) else ""),
-              f"- **Used by:** {', '.join(f'PR {u:02d}' for u in sorted(used_by[n])) or 'no later PR imports it'}",
-              "", "| File | Status | + | − | What changed |", "|---|---|---|---|---|"]
-        for p in plan.files_of(n):
-            st, a, d, _ = plan.changed[p]
-            what = "<br>".join(changes.get(p) or ["—"]).replace("|", "\\|")
+              f"- **Used by:** {', '.join(f'PR {u:02d}' for u in sorted(used_by[n])) or 'no later PR imports it'}"]
+        if s and s["head"]:
+            L.append(f"- **Branch head:** `{s['head'][:12]}`"
+                     + (f"; **behind PR {n - 1:02d} by {s['behind']} commit(s): run `sync {n - 1}`**"
+                        if s["behind"] and n > 1 else "; in sync with the PR below" if n > 1 else ""))
+        if s and s["drift"]:
+            L.append("- **Drift:** " + "; ".join(
+                f"`{p}` belongs to " + (f"PR {o:02d}" if o else "no PR") for p, o in s["drift"]))
+        if s and s["commits"]:
+            L += ["- **Commits since cut:**",
+                  *(f"  - `{c['sha']}` {c['date']} {c['subject']} — {short((f'`{x}`' for x in c['files']), 5)}"
+                    for c in s["commits"])]
+        elif s and s["commits"] == []:
+            L.append("- **Commits since cut:** none")
+        if g:
+            L.append(f"- **Review:** {(g.get('reviewDecision') or 'no decision').lower().replace('_', ' ')}; CI "
+                     f"{ci_text(g['ci'])} ({g['ci']['pass']} pass, {g['ci']['fail']} fail, {g['ci']['pending']} pending)")
+            if g["threads"]:
+                L += [f"- **Unresolved review threads ({len(g['threads'])}):**",
+                      *(f"  - `{t['path']}:{t['line'] or '?'}`{' (outdated)' if t['outdated'] else ''} "
+                        f"{t['author']}: {t['body']} ([open]({t['url']}))" for t in g["threads"])]
+        L += ["", "| File | Status | + | − | What changed |", "|---|---|---|---|---|"]
+        for p in sorted(layer_stats[n]):
+            st, a, d, _ = layer_stats[n][p]
+            what = "<br>".join(changes[n].get(p) or ["—"]).replace("|", "\\|")
             L.append(f"| `{p}` | {st} | {a} | {d} | {what} |")
         L.append("")
-    L += ["## File → PR index", "", "| File | PR | Status | + | − |", "|---|---|---|---|---|"]
-    for p in sorted(plan.changed):
+    touched = collections.defaultdict(list)
+    for n, stats in layer_stats.items():
+        for p in stats:
+            touched[p].append(n)
+    L += ["## File → PR index", "", "| File | Owner (plan) | Changed in | Status | + | − |", "|---|---|---|---|---|---|"]
+    for p in sorted(set(plan.changed) | set(touched)):
         n = plan.pr_of(p)
-        st, a, d, _ = plan.changed[p]
-        L.append(f"| `{p}` | {'excluded' if n is None else f'{n:02d}' if n else '**UNASSIGNED**'} | {st} | {a} | {d} |")
+        st, a, d, _ = plan.changed.get(p, ("·", 0, 0, False))
+        owner = "excluded" if n is None else f"{n:02d}" if n else "**UNASSIGNED**"
+        where_ = ", ".join(f"{x:02d}" for x in touched.get(p, [])) or "—"
+        L.append(f"| `{p}` | {owner} | {where_} | {st} | {a} | {d} |")
     L += ["", "## Making a change", "",
           "| Situation | Do this |", "|---|---|",
+          f"| Review comment on PR k | `{run} status --prs` (or this file's card) shows the thread with file:line. Fix on "
+          f"branch k, commit, `{run} sync k`, regenerate. Reply to or resolve the thread only with the author's go. |",
           "| Fix in PR k | Check out branch k (or `git worktree add <dir> <branch>`), commit in the repo's subject "
           f"format, then `{run} sync k` to merge it up to the top. Re-run PR k's check and the top branch's tests. |",
-          f"| New file | Add its path to `{plan.path}` under the first PR that needs it, `{run} check`, commit it on "
-          "that branch, `sync`. |",
+          f"| New file | Add its path to `{plan.path}` under the first PR that needs it, commit it on that branch, "
+          "`sync`, regenerate (drift disappears once plan and branch agree). |",
           "| Move a file to another PR | Before pushing: change the plan, delete the local branches from the "
           f"earlier of the two PRs up, `{run} cut`. After pushing: only with the reviewers' agreement. |",
-          "| Source changed before cutting | Re-snapshot, update `source`, `check`, regenerate this file. |",
+          "| Base moved (release got new commits) | Merge the base into branch 01 only if the PRs need it "
+          "(`git merge --no-edit <base>`), then `sync 1`. |",
           "| A PR merged | Delete its branch on merge; the next PR retargets to the base. Regenerate with `--prs`. |",
           ""]
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         f.write("\n".join(L))
     print(f"wrote {args.out} ({len(L)} lines)")
+
+
+def cmd_status(args):
+    plan = Plan(args.plan)
+    state = branch_state(plan)
+    gh = github(plan) if args.prs else {}
+    print(f"base {plan.base} · fork {plan.fork[:10]} · {'cut ' + plan.cut['date'] if plan.cut else 'not cut'}")
+    if state:
+        print(f"{'#':<3}{'branch head':<13}{'since cut':<11}{'in sync':<14}{'drift':<7}{'PR':<16}{'review':<20}"
+              f"{'threads':<9}CI")
+        for pr in plan.prs:
+            n, s, g = pr["n"], state[pr["n"]], gh.get(pr["n"], {})
+            since = "?" if s["commits"] is None else str(len(s["commits"]))
+            sync = "missing" if not s["head"] else "yes" if not s["behind"] else f"behind {s['behind']}"
+            num = f"#{g['number']} {g['state'].lower()}" if g else "-"
+            print(f"{n:02d} {s['head'][:10] or '-':<13}{since:<11}{sync:<14}{len(s['drift']):<7}{num:<16}"
+                  f"{(g.get('reviewDecision') or '-').lower():<20}{len(g.get('threads', [])) if g else '-'!s:<9}"
+                  f"{ci_text(g.get('ci')) if g else '-'}")
+    print("\nNext steps:", *(f"  - {x}" for x in next_steps(plan, state, gh)), sep="\n")
 
 
 def cmd_cut(args):
@@ -611,7 +817,7 @@ def cmd_cut(args):
             sys.exit(f"branch {pr['branch']} already exists; delete it or rename the plan first")
     with tempfile.TemporaryDirectory() as tmp:
         env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index")}
-        parent = plan.fork
+        parent, heads = plan.fork, {}
         for pr in plan.prs:
             git("read-tree", parent, env=env)
             for p in plan.files_of(pr["n"]):
@@ -624,7 +830,12 @@ def cmd_cut(args):
             tree = git("write-tree", env=env).strip()
             parent = git("commit-tree", tree, "-p", parent, "-m", pr["title"]).strip()
             git("update-ref", f"refs/heads/{pr['branch']}", parent, "")
+            heads[pr["branch"]] = parent
             print(f"{pr['n']:02d} {pr['branch']} {parent[:10]}")
+    with open(plan.cut_path, "w") as f:
+        json.dump(dict(date=f"{datetime.datetime.now():%Y-%m-%d %H:%M}", source=plan.source_sha, fork=plan.fork,
+                       branches=heads), f, indent=1)
+    print(f"recorded the cut in {plan.cut_path}")
     rest = git("diff", "--stat", parent, plan.source, "--", ".", *[f":!{x}" for x in plan.exclude]).strip()
     print("top branch == source (excluded paths aside)" if not rest else f"MISMATCH between top and source:\n{rest}")
 
@@ -675,8 +886,11 @@ def main():
     sub.add_parser("check").set_defaults(fn=cmd_check)
     d = sub.add_parser("doc")
     d.add_argument("--out", default=".stack/STACK.md")
-    d.add_argument("--prs", action="store_true", help="look up PR numbers with gh")
+    d.add_argument("--prs", action="store_true", help="also read PR state, reviews, threads and CI with gh")
     d.set_defaults(fn=cmd_doc)
+    st = sub.add_parser("status")
+    st.add_argument("--prs", action="store_true", help="also read PR state, reviews, threads and CI with gh")
+    st.set_defaults(fn=cmd_status)
     sub.add_parser("cut").set_defaults(fn=cmd_cut)
     v = sub.add_parser("verify")
     v.add_argument("--cmd", required=True)
