@@ -1101,11 +1101,16 @@ def cmd_publish(args):
             retargets.append((pr, g, want))
         elif g["state"] == "CLOSED":
             skipped.append(f"PR {n:02d}: #{g['number']} is closed; reopen it by hand (left alone)")
-    print("Push:", *(f"  {p['branch']}{' (force-with-lease)' if f else ''}" for p, f in pushes) or ["  nothing"],
+    for target in {b for _, b in creates} | {b for _, _, b in retargets}:
+        pushed_in_this_run = any(pr["branch"] == target for pr, _ in pushes)
+        if not pushed_in_this_run and not ref_of(target, "remote"):
+            problems_.append(f"base branch `{target}` is not on origin; push it first "
+                             f"(`git push -u origin {target}`, with the user's go)")
+    print("Push:", *([f"  {p['branch']}{' (force-with-lease)' if f else ''}" for p, f in pushes] or ["  nothing"]),
           sep="\n")
-    print("Open PRs:", *(f"  {p['branch']} → base {b}{' (draft)' if args.draft else ''}" for p, b in creates)
-          or ["  none"], sep="\n")
-    print("Fix base:", *(f"  #{g['number']} {g['baseRefName']} → {b}" for p, g, b in retargets) or ["  none"],
+    print("Open PRs:", *([f"  {p['branch']} → base {b}{' (draft)' if args.draft else ''}" for p, b in creates]
+                         or ["  none"]), sep="\n")
+    print("Fix base:", *([f"  #{g['number']} {g['baseRefName']} → {b}" for p, g, b in retargets] or ["  none"]),
           sep="\n")
     print(f"Refresh the generated block in every open PR description ({len(plan.prs) - len(merged)} PRs).")
     if skipped:
