@@ -275,6 +275,11 @@ def main():
     check("next steps: squash merge detected", "squash- or rebase-merged" in "\n".join(
         stack.next_steps(plan, stack.branch_state(plan, frozenset({1})), gh)))
     ctx = stack.context(plan, False)
+    first, second = stack.render_body(plan, ctx, plan.prs[0]), stack.render_body(plan, ctx, plan.prs[1])
+    check("PR body: bottom PR carries the stack overview", "## Stack overview: 2 PRs" in first
+          and plan.prs[1]["title"] in first and "## This PR" in first)
+    check("PR body: other PRs carry only their own card", "Stack overview" not in second
+          and plan.prs[0]["title"] not in second and "Layer 2 of 2" in second and "overview" in second)
     ctx["changes"][2] = {p: ["x" * 5000] * 20 for p in ctx["layer_stats"][2]}
     body = stack.render_body(plan, ctx, plan.prs[1])
     check("PR body: cut to GitHub's limit", len(body) <= stack.BODY_LIMIT and body.endswith(stack.BODY_END))

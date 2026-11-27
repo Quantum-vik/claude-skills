@@ -86,8 +86,9 @@ needs the official extension: `gh extension install github/gh-stack` (installing
 8. **Publish (only on the user's go).** `stack.py publish` (dry run) fetches, then lists what it would push, which
    PRs it would open (each with the right base: the nearest lower PR that is not merged), which wrong bases it
    would fix, and that it refreshes every open PR description. Show it to the user; on their go run
-   `publish --yes` (`--draft` for draft PRs). Each description gets a generated block (the stack list with this PR
-   marked, plus its card) between `<!-- stacked-prs:start/end -->` markers; text the author writes outside the
+   `publish --yes` (`--draft` for draft PRs). Each description gets a generated block between `<!-- stacked-prs:start/end -->` markers: the lowest open PR
+   carries the stack overview (stack type, how to merge, every PR with its purpose and size, the plan's decisions)
+   plus its own card; every other PR carries only its own card and one line pointing at the overview; text the author writes outside the
    markers is kept on every refresh. Re-running `publish` is safe: it only does what is missing. It refuses
    diverged branches unless `--force` (only after a `restack`), branches where origin has commits you lack, and a
    PR whose base branch is not on origin (push an integration branch first). With the gh-stack extension installed

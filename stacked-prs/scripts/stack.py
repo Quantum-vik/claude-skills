@@ -812,6 +812,7 @@ def context(plan, with_gh):
             needs[pb][pa].add(f"`{what}`")
             used_by[pa].add(pb)
     return dict(gh=gh, merged=merged, state=state, snapshot_sha=snapshot_sha, edges=edges,
+                stack_url=stack_url_of(plan) if with_gh else "",
                 found=problems(plan, edges), layer_stats=layer_stats, changes=changes, needs=needs, used_by=used_by)
 
 
@@ -870,17 +871,49 @@ BODY_START, BODY_END = "<!-- stacked-prs:start -->", "<!-- stacked-prs:end -->"
 BODY_LIMIT = 65000  # GitHub allows 65536 characters per description
 
 
+def stack_url_of(plan):
+    if not plan.github_stack or not gh_ok():
+        return ""
+    repo = subprocess.run(["gh", "repo", "view", "--json", "url", "--jq", ".url"], capture_output=True, text=True)
+    return f"{repo.stdout.strip()}/stack/{plan.github_stack}" if repo.returncode == 0 and repo.stdout.strip() else ""
+
+
 def render_body(plan, ctx, pr, limit=BODY_LIMIT):
-    """The generated part of a PR description: the stack (with this PR marked) and this PR's card."""
-    rows = []
-    for other in plan.prs:
-        g = ctx["gh"].get(other["n"])
-        mark = "👉 " if other["n"] == pr["n"] else ""
-        num = f"#{g['number']}" if g else "(not opened)"
-        state = " — merged" if other["n"] in ctx["merged"] else ""
-        rows.append(f"{other['n']:02d}. {mark}{num} {other['title']}{state}")
-    L = [BODY_START, f"**Stacked PR {pr['n']} of {len(plan.prs)}.** Review only this PR's diff; it is based on the PR "
-         "below it in this list. Merge bottom-up.", "", *rows, "", *render_card(plan, ctx, pr, "####"), BODY_END]
+    """The generated part of a PR description. The lowest open PR carries the stack overview (how to review and
+    merge, every PR with its purpose and size, the plan's decisions) plus its own card; every other PR carries only
+    its own card and one line pointing at the overview."""
+    open_ns = [x["n"] for x in plan.prs if x["n"] not in ctx["merged"]]
+    first = open_ns[0] if open_ns else plan.prs[0]["n"]
+    g_first = ctx["gh"].get(first)
+    total = len(plan.prs)
+    url = ctx.get("stack_url") or ""
+    stack_ref = f"[GitHub stack #{plan.github_stack}]({url})" if url else (
+        f"GitHub stack #{plan.github_stack}" if plan.github_stack else "this stack")
+    if pr["n"] != first:
+        where_ = f"#{g_first['number']}" if g_first else f"PR {first:02d}"
+        L = [BODY_START, f"**Layer {pr['n']} of {total}** in {stack_ref}. Review only this PR's diff; the stack "
+             f"overview (order, decisions, how to merge) is in {where_}.", "",
+             *render_card(plan, ctx, pr, "###"), BODY_END]
+    else:
+        rows = ["| # | PR | Title | Purpose | Lines |", "|---|---|---|---|---|"]
+        for other in plan.prs:
+            g = ctx["gh"].get(other["n"])
+            num = f"#{g['number']}" if g else "—"
+            state = " (merged)" if other["n"] in ctx["merged"] else ""
+            counted, _ = size_of(ctx["layer_stats"][other["n"]])
+            purpose = (other.get("purpose") or "").replace("|", "\\|").replace("\n", " ")
+            mark = "👉 " if other["n"] == pr["n"] else ""
+            rows.append(f"| {other['n']:02d} | {mark}{num}{state} | {other['title']} | {purpose} | {counted} |")
+        merge_how = ("Merge from the stack map in the merge box: merging a PR also merges every PR below it, and "
+                     "GitHub retargets and rebases the PRs above." if plan.github_stack else
+                     "Merge bottom-up with merge commits; with \"delete branch on merge\" GitHub retargets the next PR.")
+        L = [BODY_START, f"## Stack overview: {total} PRs", "",
+             f"This PR is the bottom of {stack_ref}, based on `{expected_base(plan, pr['n'], ctx['merged'])}`. "
+             "Each PR above it is based on the one below and shows only its own layer, so review them in order.",
+             "", f"**Stack type:** {plan.stack_type or 'not stated'}", "", f"**Merging:** {merge_how}", "", *rows, ""]
+        if plan.notes:
+            L += ["### Decisions and known issues", "", plan.notes.strip(), ""]
+        L += ["## This PR", "", *render_card(plan, ctx, pr, "###"), BODY_END]
     body = "\n".join(L)
     if len(body) > limit:
         body = body[:max(limit - 200, 0)] + "\n\n_(cut to fit GitHub's limit; the stack document has the full card)_\n" \
@@ -966,11 +999,7 @@ def cmd_doc(args):
     total_kept = sum(size_of(ctx["layer_stats"][pr["n"]])[0] for pr in plan.prs)
     total_deleted = sum(size_of(ctx["layer_stats"][pr["n"]])[1] for pr in plan.prs)
     run = f"python3 {SELF} --plan {plan.path}"
-    stack_url = ""
-    if plan.github_stack and gh_ok():
-        repo_url = subprocess.run(["gh", "repo", "view", "--json", "url", "--jq", ".url"], capture_output=True,
-                                  text=True).stdout.strip()
-        stack_url = f"{repo_url}/stack/{plan.github_stack}" if repo_url else ""
+    stack_url = ctx.get("stack_url") or (stack_url_of(plan) if plan.github_stack else "")
     cut_branches = sum(1 for s in state.values() if s["head"])
     if state:
         mode = (f"**branches** (cut {plan.cut['date']} from `{plan.cut['source'][:12]}`); every card below is "
