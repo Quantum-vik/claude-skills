@@ -19,7 +19,7 @@ Kit (paths relative to this skill's folder, `~/.claude/skills/stacked-prs/`):
 
 | File | Role |
 |---|---|
-| `scripts/stack.py` | `snapshot`, `init`, `check`, `doc`, `cut`, `verify`, `sync` (run with `--help`) |
+| `scripts/stack.py` | `snapshot`, `init`, `check`, `doc [--prs]`, `cut`, `verify`, `sync` (run with `--help`) |
 | `reference/plan-format.md` | The plan file (`.stack/stack.toml`) and how paths match |
 | `reference/fixing.md` | How to resolve order problems, cycles, migrations and over-cap PRs |
 
@@ -55,10 +55,20 @@ Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `
    - *runnable*: every branch passes its checks (needs expand/contract splits and sometimes split migrations).
    Show the user the size table and the open problems, and wait for approval. Done when `check` prints `OK`, or
    every remaining problem is accepted by the user and recorded in the document.
-5. **Write the document.** `stack.py doc --out <path>` generates the stack map, one card per PR (files, size,
-   depends on / used by from the import graph), the file → PR index and the change procedure. Fill every `TODO`
-   (purpose, check command, stack type) through `purpose` / `check` keys in the plan or by editing the output, and
-   add the accepted exceptions. Put it where the repo keeps design docs, or ask. Done when no `TODO` remains.
+5. **Write the document.** `stack.py doc --out <path>` generates, from git alone:
+   - a *Read me first* guide for any later session, the *starting state* (base, fork point, source sha, branches
+     cut and whether the top matches the source, stack type, exclusions), the branch tree and the stack map;
+   - *problems and decisions* (over-cap PRs, open `check` problems, your `notes`);
+   - one card per PR: title, branch and base, size, purpose, check, **lands after** (each earlier PR with the exact
+     imports that force the order; `⚠` marks a dependency on a later PR) and **used by**, plus a per-file
+     **what changed** table: symbols added / removed / changed with line ranges and +/− lines, changed signatures
+     and class methods, code moved between files (`unchanged` or `then +a/−b`), import changes, and changed line
+     ranges for non-Python files;
+   - the file → PR index and the change procedure.
+   Fill `purpose` and `check` per PR and `stack_type` / `notes` in the plan (they are rendered into the document),
+   then regenerate; never hand-edit the generated file, or the next regeneration loses it. Put it where the repo
+   keeps design docs, or ask. Done when no `TODO` remains. After the PRs are opened, regenerate with `--prs` to
+   fill the PR numbers and states (needs `gh`).
 6. **Cut (after approval).** `stack.py cut` creates the N branches from the fork point with one commit each and
    confirms the top branch equals the source. It refuses if a branch already exists.
 7. **Verify.** `stack.py verify --cmd "<build/test command>"` runs the command in a fresh worktree of each branch
@@ -67,6 +77,13 @@ Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `
 8. **Publish (only on the user's go).** For each branch in order: `git push -u origin <branch>`, then
    `gh pr create --base <branch below, or base for PR 1> --head <branch> --title "<title>" --body-file <file>`,
    where the body is the stack map plus that PR's card from the document. Then add each PR's number to the map.
+
+## Picking up an existing stack (new session)
+
+Read the stack document first, not the code: *Read me first*, *Starting state*, then the card of the PR you are
+working on. Its *what changed* table says which symbols changed and where; open a file only for logic you need,
+and skip code marked `moved … unchanged`. Confirm it is current: the source sha in the header must match the plan's
+`source`, and if branches exist the starting state must say the top branch matches. Otherwise regenerate it.
 
 ## Keeping the stack healthy
 

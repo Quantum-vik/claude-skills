@@ -5,7 +5,8 @@ Subcommands (run from the repo root; the plan defaults to .stack/stack.toml):
   snapshot              commit the staged index as a dangling commit (no branch moves) and print its sha
   init                  write a plan skeleton and list every changed file with its size
   check                 unassigned files, PR sizes against the cap, Python import order problems and cycles
-  doc [--out FILE]      write the stack document (map, per-PR cards, file index, change procedure)
+  doc [--out F] [--prs] write the stack document: session guide, state, map, per-PR cards with a per-file
+                        change summary, dependency reasons, problems, file index, change procedure
   cut                   create the PR branches with plumbing only; your checkout and working tree are untouched
   verify --cmd CMD      run CMD in a temporary worktree of each branch and report pass/fail
   sync N                merge branch N into N+1, N+1 into N+2, ... up to the top (stops on a conflict)
@@ -14,7 +15,9 @@ import argparse
 import ast
 import collections
 import datetime
+import difflib
 import fnmatch
+import json
 import os
 import shutil
 import subprocess
@@ -23,10 +26,11 @@ import tempfile
 import tomllib
 
 PLAN_DEFAULT = ".stack/stack.toml"
+SELF = os.path.abspath(__file__)
 
 
-def git(*args, env=None, check=True, data=None):
-    r = subprocess.run(["git", *args], capture_output=True, env=env, input=data)
+def git(*args, env=None, check=True):
+    r = subprocess.run(["git", *args], capture_output=True, env=env)
     if check and r.returncode:
         sys.exit(f"git {' '.join(args)} failed: {r.stderr.decode().strip()}")
     return r.stdout.decode("utf-8", "replace")
@@ -38,22 +42,26 @@ def matches(path, pattern):
 
 class Plan:
     def __init__(self, path):
+        self.path = path
         with open(path, "rb") as f:
             cfg = tomllib.load(f)
         self.base, self.source = cfg["base"], cfg["source"]
         self.prefix, self.cap = cfg["branch_prefix"], cfg.get("cap", 700)
         self.exclude, self.prs = cfg.get("exclude", []), cfg.get("pr", [])
+        self.stack_type = cfg.get("stack_type", "")
+        self.notes = cfg.get("notes", "")
         for n, pr in enumerate(self.prs, 1):
             pr["n"], pr["branch"] = n, f"{self.prefix}{n:02d}-{pr['name']}"
+        self.source_sha = git("rev-parse", self.source).strip()
         self.fork = git("merge-base", self.base, self.source).strip()
-        self.changed = {}  # path -> (status, added, deleted)
+        self.changed = {}  # path -> (status, added, deleted, binary)
         stats = {}
         for line in git("diff", "--numstat", "--no-renames", self.fork, self.source).splitlines():
             a, d, p = line.split("\t", 2)
-            stats[p] = (int(a) if a != "-" else 0, int(d) if d != "-" else 0)
+            stats[p] = (int(a) if a != "-" else 0, int(d) if d != "-" else 0, a == "-")
         for line in git("diff", "--name-status", "--no-renames", self.fork, self.source).splitlines():
             st, p = line.split("\t", 1)
-            self.changed[p] = (st[0], *stats.get(p, (0, 0)))
+            self.changed[p] = (st[0], *stats.get(p, (0, 0, False)))
 
     def pr_of(self, path):
         """Longest matching pattern wins; None = excluded, 0 = unassigned."""
@@ -72,34 +80,45 @@ class Plan:
     def size(self, n):
         counted = deleted = 0
         for p in self.files_of(n):
-            st, a, d = self.changed[p]
+            st, a, d, _ = self.changed[p]
             if st == "D":
                 deleted += d
             else:
                 counted += a + d
         return counted, deleted
 
+    def base_of(self, pr):
+        return self.base if pr["n"] == 1 else self.prs[pr["n"] - 2]["branch"]
 
-# ---------- Python import analysis ----------
 
-def read_tree(rev):
-    """All .py files at rev -> source text."""
-    paths = [p for p in git("ls-tree", "-r", "--name-only", rev).splitlines() if p.endswith(".py")]
+def read_blobs(rev, paths):
+    """path -> text for the given paths at rev (missing paths are skipped)."""
+    paths = sorted(paths)
     out = subprocess.run(["git", "cat-file", "--batch"], input="".join(f"{rev}:{p}\n" for p in paths).encode(),
                          capture_output=True).stdout
     files, i = {}, 0
     for p in paths:
         nl = out.index(b"\n", i)
-        size = int(out[i:nl].split()[2])
+        header = out[i:nl].split()
+        if header[-1] == b"missing":
+            i = nl + 1
+            continue
+        size = int(header[2])
         files[p] = out[nl + 1:nl + 1 + size].decode("utf-8", "replace")
         i = nl + 1 + size + 1
     return files
+
+
+def read_tree(rev):
+    return read_blobs(rev, [p for p in git("ls-tree", "-r", "--name-only", rev).splitlines() if p.endswith(".py")])
 
 
 def modname(path):
     m = path[:-3].replace("/", ".")
     return m[:-9] if m.endswith(".__init__") else m
 
+
+# ---------- Python import analysis ----------
 
 class Tree:
     def __init__(self, files):
@@ -170,13 +189,15 @@ class Tree:
         return self.mods.get(f"{mod}.{name}") if name and f"{mod}.{name}" in self.mods else self.mods.get(mod)
 
 
-def constraints(plan):
-    """Edges (a, b, why) meaning PR(a) must be <= PR(b), for changed Python files."""
-    old, new = Tree(read_tree(plan.fork)), Tree(read_tree(plan.source))
+def trees(plan):
+    return Tree(read_tree(plan.fork)), Tree(read_tree(plan.source))
+
+
+def constraints(plan, old, new):
+    """Edges (a, b, symbol, why): PR(a) must be <= PR(b), for changed Python files."""
     roots = {p.split("/")[0] if "/" in p else modname(p) for p in [*old.files, *new.files]}
-    py = [p for p in plan.changed if p.endswith(".py")]
     edges = []
-    for a in py:
+    for a in (p for p in plan.changed if p.endswith(".py")):
         for tree, other, label in ((new, old, "new"), (old, new, "old")):
             if a not in tree.files:
                 continue
@@ -188,15 +209,15 @@ def constraints(plan):
                     continue
                 what = f"{mod}:{name}" if name else mod
                 if label == "new":  # new a needs something only the new b has -> b first
-                    edges.append((b, a, f"new {a} imports {what}, which only exists after {b} changes"))
+                    edges.append((b, a, what, f"new {a} imports {what}, which only exists after {b} changes"))
                 else:  # old a needs something the new b removes -> a must change no later than b
-                    edges.append((a, b, f"old {a} imports {what}, which {b} removes"))
+                    edges.append((a, b, what, f"old {a} imports {what}, which {b} removes"))
     return edges
 
 
 def cycles(nodes, edges):
     graph = collections.defaultdict(set)
-    for a, b, _ in edges:
+    for a, b, *_ in edges:
         graph[a].add(b)
     index, low, stack, on, out, counter = {}, {}, [], set(), [], [0]
     sys.setrecursionlimit(100000)
@@ -229,6 +250,187 @@ def cycles(nodes, edges):
     return out
 
 
+def problems(plan, edges):
+    """Lines describing everything check complains about; empty list = clean."""
+    out = []
+    unassigned = [p for p in plan.changed if plan.pr_of(p) == 0]
+    if unassigned:
+        out += ["UNASSIGNED (add to a PR or to exclude):", *(f"  {p}" for p in unassigned)]
+    wrong = [e for e in edges if (plan.pr_of(e[0]) or 0) > (plan.pr_of(e[1]) or 0) and plan.pr_of(e[1])]
+    if wrong:
+        out.append(f"ORDER PROBLEMS ({len(wrong)}): left file must land in the same or an earlier PR than the right")
+        for a, b, _, why in sorted(wrong, key=lambda e: (plan.pr_of(e[1]), e[0])):
+            out += [f"  PR {plan.pr_of(a):02d} {a}  ->  PR {plan.pr_of(b):02d} {b}", f"      {why}"]
+    for comp in cycles(plan.changed, edges):
+        prs = sorted({plan.pr_of(p) for p in comp if plan.pr_of(p)})
+        if len(prs) > 1:
+            out.append(f"CYCLE across PRs {prs}: these files need each other; same PR, or split one (expand/contract):")
+            out += [f"  PR {plan.pr_of(p):02d} {p}" for p in comp]
+    return out
+
+
+# ---------- change summaries ----------
+
+def _sig(fn):
+    returns = f" -> {ast.unparse(fn.returns)}" if fn.returns else ""
+    return f"({ast.unparse(fn.args)}){returns}"
+
+
+def symbols(src):
+    """name -> dict(kind, start, end, sig, body, members) for top-level defs, classes and assignments."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None, set()
+    lines = src.splitlines()
+
+    def entry(kind, n, sig="", members=None):
+        return dict(kind=kind, start=n.lineno, end=n.end_lineno, sig=sig, members=members,
+                    body="\n".join(lines[n.lineno - 1:n.end_lineno]))
+
+    out, imports = {}, set()
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[n.name] = entry("def", n, _sig(n))
+        elif isinstance(n, ast.ClassDef):
+            members = {m.name: entry("def", m, _sig(m)) for m in n.body
+                       if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            bases = ", ".join(ast.unparse(b) for b in n.bases)
+            out[n.name] = entry("class", n, f"({bases})" if bases else "", members)
+        elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                if isinstance(t, ast.Name):
+                    out[t.id] = entry("const", n)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            imports.add(ast.unparse(n))
+    return out, imports
+
+
+def churn(a, b):
+    """(added, removed) lines between two texts."""
+    add = rem = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a.splitlines(), b.splitlines(), autojunk=False).get_opcodes():
+        if tag != "equal":
+            rem += i2 - i1
+            add += j2 - j1
+    return add, rem
+
+
+def hunks(a, b):
+    """New-side line ranges that changed (pure deletions shown as the line they sit before)."""
+    out = []
+    for tag, _, _, j1, j2 in difflib.SequenceMatcher(None, a.splitlines(), b.splitlines(), autojunk=False).get_opcodes():
+        if tag != "equal":
+            out.append(f"L{j1 + 1}" if j2 - j1 <= 1 else f"L{j1 + 1}–{j2}")
+    return out
+
+
+def short(items, limit=12):
+    items = list(items)
+    return ", ".join(items[:limit]) + (f", … +{len(items) - limit} more" if len(items) > limit else "")
+
+
+def where(s):
+    return f"L{s['start']}–{s['end']}" if s["end"] != s["start"] else f"L{s['start']}"
+
+
+def describe(plan, old_src, new_src):
+    """Per changed file: list of markdown bullet strings describing the change."""
+    summary = {}
+    added_by_name, removed_by_name = collections.defaultdict(list), collections.defaultdict(list)
+    parsed = {}
+    for p, (st, a, d, binary) in plan.changed.items():
+        if binary:
+            summary[p] = ["binary file"]
+            continue
+        old, new = old_src.get(p), new_src.get(p)
+        if p.endswith(".py"):
+            parsed[p] = (symbols(old) if old is not None else ({}, set()),
+                         symbols(new) if new is not None else ({}, set()))
+            osyms, nsyms = parsed[p][0][0] or {}, parsed[p][1][0] or {}
+            for name in set(nsyms) - set(osyms):
+                if nsyms[name]["kind"] != "const":
+                    added_by_name[name].append(p)
+            for name in set(osyms) - set(nsyms):
+                if osyms[name]["kind"] != "const":
+                    removed_by_name[name].append(p)
+    for p, (st, a, d, binary) in plan.changed.items():
+        if binary:
+            continue
+        old, new = old_src.get(p), new_src.get(p)
+        lines = []
+        if p not in parsed or parsed[p][0][0] is None or parsed[p][1][0] is None:
+            if old is None:
+                lines.append(f"new file, {len((new or '').splitlines())} lines")
+            elif new is None:
+                lines.append(f"deleted, was {len(old.splitlines())} lines")
+            else:
+                lines.append(f"changed at {short(hunks(old, new), 10)}")
+            summary[p] = lines
+            continue
+        (osyms, oimps), (nsyms, nimps) = parsed[p]
+
+        def moved(name, here, table, word, body, side):
+            others = [x for x in table.get(name, []) if x != here]
+            if not others:
+                return ""
+            there = parsed[others[0]][side][0][name]["body"]
+            add, rem = churn(there, body) if side == 0 else churn(body, there)
+            return f" ({word} `{others[0]}`, " + ("unchanged)" if add == rem == 0 else f"then +{add}/−{rem})")
+
+        if old is None:
+            lines.append(f"new file, {len(new.splitlines())} lines")
+        elif new is None:
+            lines.append(f"deleted, was {len(old.splitlines())} lines")
+        for name in sorted(set(nsyms) - set(osyms), key=lambda k: nsyms[k]["start"]):
+            s = nsyms[name]
+            lines.append(f"added {s['kind']} `{name}{s['sig']}` {where(s)}"
+                         f"{moved(name, p, removed_by_name, 'moved from', s['body'], 0)}")
+        for name in sorted(set(osyms) - set(nsyms), key=lambda k: osyms[k]["start"]):
+            s = osyms[name]
+            lines.append(f"removed {s['kind']} `{name}` (was {where(s)})"
+                         f"{moved(name, p, added_by_name, 'moved to', s['body'], 1)}")
+        for name in sorted(set(osyms) & set(nsyms), key=lambda k: nsyms[k]["start"]):
+            o, n = osyms[name], nsyms[name]
+            if o["body"] == n["body"]:
+                continue
+            add, rem = churn(o["body"], n["body"])
+            text = f"changed {n['kind']} `{name}` {where(n)} (+{add}/−{rem})"
+            if o["sig"] != n["sig"]:
+                text += f"; signature `{o['sig']}` → `{n['sig']}`"
+            if n["kind"] == "class":
+                om, nm = o["members"] or {}, n["members"] or {}
+                parts = [f"+`{m}`" for m in nm if m not in om] + [f"−`{m}`" for m in om if m not in nm]
+                parts += [f"~`{m}`" + (f" sig `{om[m]['sig']}` → `{nm[m]['sig']}`" if om[m]["sig"] != nm[m]["sig"] else "")
+                          for m in nm if m in om and om[m]["body"] != nm[m]["body"]]
+                if parts:
+                    text += f"; methods {short(parts, 10)}"
+            lines.append(text)
+        if old is None and nimps:
+            lines.append(f"imports: {short(f'`{i}`' for i in sorted(nimps))}")
+        if old is not None and new is not None:
+            if nimps - oimps:
+                lines.append(f"imports added: {short(f'`{i}`' for i in sorted(nimps - oimps))}")
+            if oimps - nimps:
+                lines.append(f"imports removed: {short(f'`{i}`' for i in sorted(oimps - nimps))}")
+            if len(lines) == 0:
+                lines.append(f"module-level code changed at {short(hunks(old, new), 10)}")
+        summary[p] = lines
+    return summary
+
+
+def pr_numbers(plan):
+    if shutil.which("gh") is None:
+        return {}
+    out = {}
+    for pr in plan.prs:
+        r = subprocess.run(["gh", "pr", "list", "--head", pr["branch"], "--state", "all", "--json", "number,state,url"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip() not in ("", "[]"):
+            out[pr["n"]] = json.loads(r.stdout)[0]
+    return out
+
+
 # ---------- subcommands ----------
 
 def cmd_snapshot(_):
@@ -240,16 +442,19 @@ def cmd_init(args):
     if not os.path.exists(args.plan):
         os.makedirs(os.path.dirname(args.plan) or ".", exist_ok=True)
         with open(args.plan, "w") as f:
-            f.write('base = "main"            # branch the bottom PR targets\n'
+            f.write('base = "origin/main"     # branch the bottom PR targets (fetch first)\n'
                     'source = "HEAD"          # commit holding the whole change (see `snapshot`)\n'
                     'branch_prefix = "stack/feature-"\n'
                     'cap = 700                # max added+deleted lines in kept files\n'
-                    'exclude = []             # paths that stay out of the stack\n\n'
-                    '[[pr]]\nname = "first-layer"\ntitle = "feat: first layer"\npaths = []\n')
+                    'exclude = []             # paths that stay out of the stack\n'
+                    'stack_type = ""          # "review slices" or "runnable", with the reason\n'
+                    'notes = ""               # accepted exceptions, decisions, open checks (markdown)\n\n'
+                    '[[pr]]\nname = "first-layer"\ntitle = "feat: first layer"\npurpose = ""\ncheck = ""\n'
+                    'paths = []\n')
         print(f"wrote {args.plan}; set base/source, then fill the [[pr]] blocks")
     plan = Plan(args.plan)
     by_dir = collections.defaultdict(list)
-    for p, (st, a, d) in sorted(plan.changed.items()):
+    for p, (st, a, d, _) in sorted(plan.changed.items()):
         by_dir[os.path.dirname(p) or "."].append(f"  {st} {a:>5} {d:>5}  {p}")
     for d, rows in sorted(by_dir.items()):
         print(f"{d}/")
@@ -260,90 +465,141 @@ def cmd_init(args):
 
 
 def cmd_check(args):
-    plan, bad = Plan(args.plan), 0
-    unassigned = [p for p in plan.changed if plan.pr_of(p) == 0]
-    if unassigned:
-        bad = 1
-        print("UNASSIGNED (add to a PR or to exclude):", *unassigned, sep="\n  ")
+    plan = Plan(args.plan)
     excluded = [p for p in plan.changed if plan.pr_of(p) is None]
     if excluded:
         print("excluded:", *excluded, sep="\n  ")
     for pr in plan.prs:
         files = plan.files_of(pr["n"])
         counted, deleted = plan.size(pr["n"])
-        flag = "  OVER CAP" if counted > plan.cap else ""
-        flag += "  EMPTY" if not files else ""
+        flag = ("  OVER CAP" if counted > plan.cap else "") + ("  EMPTY" if not files else "")
         print(f"{pr['n']:02d} {pr['name']:<32} {counted:>6} lines  {deleted:>6} deleted  {len(files):>3} files{flag}")
-    edges = constraints(plan)
-    wrong = [(a, b, w) for a, b, w in edges if (plan.pr_of(a) or 0) > (plan.pr_of(b) or 0) and plan.pr_of(b)]
-    if wrong:
-        bad = 1
-        print(f"\nORDER PROBLEMS ({len(wrong)}): left file must land in the same or an earlier PR than the right file")
-        for a, b, w in sorted(wrong, key=lambda e: (plan.pr_of(e[1]), e[0])):
-            print(f"  PR {plan.pr_of(a):02d} {a}  ->  PR {plan.pr_of(b):02d} {b}\n      {w}")
-    for comp in cycles(plan.changed, edges):
-        prs = sorted({plan.pr_of(p) for p in comp if plan.pr_of(p)})
-        if len(prs) > 1:
-            bad = 1
-            print(f"\nCYCLE across PRs {prs}: these files need each other; same PR, or split one file (expand/contract):")
-            print(*(f"  PR {plan.pr_of(p):02d} {p}" for p in comp), sep="\n")
-    print("\nOK" if not bad else "\nFIX the problems above, then re-run check")
-    return bad
+    found = problems(plan, constraints(plan, *trees(plan)))
+    print("", *found, sep="\n")
+    print("OK" if not found else "FIX the problems above, then re-run check")
+    return 1 if found else 0
 
 
 def cmd_doc(args):
     plan = Plan(args.plan)
-    edges = constraints(plan)
-    deps = collections.defaultdict(set)
-    for a, b, _ in edges:
+    old, new = trees(plan)
+    edges = constraints(plan, old, new)
+    found = problems(plan, edges)
+    paths = list(plan.changed)
+    changes = describe(plan, read_blobs(plan.fork, paths), read_blobs(plan.source, paths))
+    numbers = pr_numbers(plan) if args.prs else {}
+    needs = collections.defaultdict(lambda: collections.defaultdict(set))  # pr -> other pr -> {symbol}
+    used_by = collections.defaultdict(set)
+    for a, b, what, _ in edges:
         pa, pb = plan.pr_of(a), plan.pr_of(b)
         if pa and pb and pa != pb:
-            deps[pb].add(pa)
-    used_by = collections.defaultdict(set)
-    for b, ps in deps.items():
-        for a in ps:
-            used_by[a].add(b)
-    L = [f"# Stacked PR plan: {plan.prefix.rstrip('-/')}", "",
-         f"Generated {datetime.date.today()} from `{plan.source}` against `{plan.base}` (fork point `{plan.fork[:10]}`).",
-         f"Cap: {plan.cap} lines per PR (added + deleted lines in files that remain; whole-file deletions are listed, "
-         "not counted).", "",
-         "## Stack type", "", "TODO: review slices (only the top branch must run) or runnable (every branch passes "
-         "its checks). Say which, and why.", "",
-         "## Stack map", "", "| # | Branch | Base | Title | Lines | Deleted | Files |", "|---|---|---|---|---|---|---|"]
-    for pr in plan.prs:
-        base = plan.base if pr["n"] == 1 else plan.prs[pr["n"] - 2]["branch"]
-        counted, deleted = plan.size(pr["n"])
-        over = " ⚠" if counted > plan.cap else ""
-        L.append(f"| {pr['n']:02d} | `{pr['branch']}` | `{base}` | {pr['title']} | {counted}{over} | {deleted} | "
-                 f"{len(plan.files_of(pr['n']))} |")
-    L += ["", "## PRs", ""]
+            needs[pb][pa].add(f"`{what}`")
+            used_by[pa].add(pb)
+    heads = {pr["n"]: git("rev-parse", "--verify", "--quiet", f"refs/heads/{pr['branch']}", check=False).strip()
+             for pr in plan.prs}
+    top = plan.prs[-1] if plan.prs else None
+    top_matches = bool(top and heads[top["n"]]) and subprocess.run(
+        ["git", "diff", "--quiet", heads[top["n"]], plan.source_sha, "--", ".", *[f":!{x}" for x in plan.exclude]]
+    ).returncode == 0
+    total_kept = sum(plan.size(pr["n"])[0] for pr in plan.prs)
+    total_deleted = sum(plan.size(pr["n"])[1] for pr in plan.prs)
+    run = f"python3 {SELF} --plan {plan.path}"
+
+    L = [f"# Stacked PRs: {plan.prefix.rstrip('-/')}", "",
+         f"_Generated {datetime.date.today()} by `stack.py doc` from source `{plan.source_sha[:12]}` against "
+         f"`{plan.base}` (fork point `{plan.fork[:12]}`). Regenerate after any change: `{run} doc --out {args.out}`._",
+         "", "## Read me first", "",
+         "- **What this is:** one large change split into the PRs below. Each PR is based on the one above it in the "
+         "map; each branch contains every PR below it, so the **top branch is the whole change**.",
+         "- **Use this file instead of reading code.** Every PR card lists each file's change: symbols added, removed, "
+         "changed (line ranges in the new file, +/− lines, signature changes), code moved between files, and import "
+         "changes. Open a file only when you need its logic.",
+         "- **Moved code** is marked `moved from/to <file>, unchanged` (skip it) or `then +a/−b` (read only the "
+         "difference).",
+         "- **Find the owner of a file:** [File → PR index](#file--pr-index). **Why a PR must land after another:** "
+         "the `Lands after` line on its card names the exact imports; `⚠` marks a dependency on a later PR, which is an "
+         "order problem.",
+         "- **Before trusting it:** the source must still be `" + plan.source_sha[:12] + "`. If branches exist and "
+         "someone committed on them, regenerate first.",
+         f"- **Making a change:** see [Making a change](#making-a-change). Plan file: `{plan.path}`.", "",
+         "## Starting state", "",
+         "| Item | Value |", "|---|---|",
+         f"| Base (PR 01 targets) | `{plan.base}` |",
+         f"| Fork point | `{plan.fork[:12]}` |",
+         f"| Source (whole change) | `{plan.source}` → `{plan.source_sha[:12]}` |",
+         f"| Changed files | {len(plan.changed)} (+{sum(v[1] for v in plan.changed.values())} / "
+         f"−{sum(v[2] for v in plan.changed.values())}) |",
+         f"| In the stack | {len(plan.prs)} PRs, {total_kept} counted lines, {total_deleted} lines in deleted files |",
+         f"| Cap | {plan.cap} lines per PR (added + deleted lines in kept files; deleted files not counted) |",
+         f"| Branches cut | {sum(1 for h in heads.values() if h)} of {len(plan.prs)} exist locally"
+         + (f"; top branch {'matches' if top_matches else '**differs from**'} the source" if any(heads.values()) else "")
+         + " |",
+         f"| Stack type | {plan.stack_type or '**TODO** (review slices or runnable, and why)'} |",
+         f"| Excluded from the stack | {short(f'`{p}`' for p in plan.changed if plan.pr_of(p) is None) or 'none'} |",
+         "", "## Branch tree", "", "```", plan.base]
+    for i, pr in enumerate(plan.prs):
+        L.append(f"{'     ' * i} └── {pr['branch']}   PR {pr['n']:02d}" + (f" #{numbers[pr['n']]['number']}"
+                                                                           if pr["n"] in numbers else ""))
+    L += ["```", "", "Merge bottom-up with merge commits (not squash). With \"delete branch on merge\", GitHub retargets "
+          "the next PR to the base by itself.", "", "## Stack map", "",
+          "| # | PR | Branch | Base | Title | Lines | Deleted | Files | Lands after |",
+          "|---|---|---|---|---|---|---|---|---|"]
     for pr in plan.prs:
         n = pr["n"]
         counted, deleted = plan.size(n)
-        L += [f"### {n:02d} · {pr['name']}", "", f"**Title:** {pr['title']}  ",
-              f"**Branch:** `{pr['branch']}`  ", f"**Size:** {counted} lines, {deleted} deleted  ",
-              f"**Purpose:** {pr.get('purpose', 'TODO')}  ",
-              f"**Depends on:** {', '.join(f'PR {d:02d}' for d in sorted(deps[n])) or 'nothing in the stack'}  ",
-              f"**Used by:** {', '.join(f'PR {u:02d}' for u in sorted(used_by[n])) or 'nothing in the stack'}  ",
-              f"**Check:** {pr.get('check', 'TODO')}", "",
-              "| Status | + | − | File |", "|---|---|---|---|"]
-        L += [f"| {plan.changed[p][0]} | {plan.changed[p][1]} | {plan.changed[p][2]} | `{p}` |" for p in plan.files_of(n)]
+        num = f"[#{numbers[n]['number']}]({numbers[n]['url']}) {numbers[n]['state'].lower()}" if n in numbers else "—"
+        L.append(f"| {n:02d} | {num} | `{pr['branch']}` | `{plan.base_of(pr)}` | {pr['title']} | "
+                 f"{counted}{' ⚠' if counted > plan.cap else ''} | {deleted} | {len(plan.files_of(n))} | "
+                 f"{', '.join(f'⚠{d:02d}' if d > n else f'{d:02d}' for d in sorted(needs[n])) or '—'} |")
+    L += ["", "## Problems and decisions", ""]
+    over = [pr for pr in plan.prs if plan.size(pr["n"])[0] > plan.cap]
+    if over:
+        L.append("Over the cap: " + ", ".join(f"PR {pr['n']:02d} ({plan.size(pr['n'])[0]})" for pr in over) + ".")
         L.append("")
-    L += ["## File → PR index", "", "| File | PR |", "|---|---|"]
+    L += (["Open problems from `check`:", "", "```", *found, "```"] if found else ["`check` is clean."])
+    L += ["", plan.notes or "**TODO:** accepted exceptions and why, decisions, open checks.", "", "## PRs", ""]
+    for pr in plan.prs:
+        n = pr["n"]
+        counted, deleted = plan.size(n)
+        need_txt = "; ".join(f"{'⚠ ' if d > n else ''}PR {d:02d} for {short(sorted(syms), 6)}"
+                             for d, syms in sorted(needs[n].items()))
+        L += [f"### {n:02d} · {pr['name']}", "",
+              f"- **Title:** {pr['title']}",
+              f"- **Branch:** `{pr['branch']}` → base `{plan.base_of(pr)}`"
+              + (f" · PR [#{numbers[n]['number']}]({numbers[n]['url']})" if n in numbers else ""),
+              f"- **Size:** {counted} lines{' (over cap)' if counted > plan.cap else ''}, {deleted} in deleted files, "
+              f"{len(plan.files_of(n))} files",
+              f"- **Purpose:** {pr.get('purpose') or '**TODO**'}",
+              f"- **Check:** {pr.get('check') or '**TODO**'}",
+              f"- **Lands after:** {need_txt or 'no other PR in the stack'}"
+              + (" (⚠ = a later PR: an order problem, see Problems)" if any(d > n for d in needs[n]) else ""),
+              f"- **Used by:** {', '.join(f'PR {u:02d}' for u in sorted(used_by[n])) or 'no later PR imports it'}",
+              "", "| File | Status | + | − | What changed |", "|---|---|---|---|---|"]
+        for p in plan.files_of(n):
+            st, a, d, _ = plan.changed[p]
+            what = "<br>".join(changes.get(p) or ["—"]).replace("|", "\\|")
+            L.append(f"| `{p}` | {st} | {a} | {d} | {what} |")
+        L.append("")
+    L += ["## File → PR index", "", "| File | PR | Status | + | − |", "|---|---|---|---|---|"]
     for p in sorted(plan.changed):
         n = plan.pr_of(p)
-        L.append(f"| `{p}` | {'excluded' if n is None else f'{n:02d}' if n else 'UNASSIGNED'} |")
-    L += ["", "## Making a change later", "",
-          "1. Find the file in the index above; that PR owns it.",
-          "2. Check out that PR's branch, commit the change (commit subject in the repo's format).",
-          f"3. Carry it up the stack: `python3 {sys.argv[0]} sync <that PR number>` (merges, never rebases).",
-          "4. Re-run that PR's check, then the top branch's full tests.",
-          "5. A new file: add its path to the plan under the PR that first needs it and run `check`.",
-          "6. Moving a file to another PR after the branches exist: change the plan, delete the local branches "
-          "from that PR up, and `cut` again (only before anything is pushed, or with the reviewers' agreement).", ""]
+        st, a, d, _ = plan.changed[p]
+        L.append(f"| `{p}` | {'excluded' if n is None else f'{n:02d}' if n else '**UNASSIGNED**'} | {st} | {a} | {d} |")
+    L += ["", "## Making a change", "",
+          "| Situation | Do this |", "|---|---|",
+          "| Fix in PR k | Check out branch k (or `git worktree add <dir> <branch>`), commit in the repo's subject "
+          f"format, then `{run} sync k` to merge it up to the top. Re-run PR k's check and the top branch's tests. |",
+          f"| New file | Add its path to `{plan.path}` under the first PR that needs it, `{run} check`, commit it on "
+          "that branch, `sync`. |",
+          "| Move a file to another PR | Before pushing: change the plan, delete the local branches from the "
+          f"earlier of the two PRs up, `{run} cut`. After pushing: only with the reviewers' agreement. |",
+          "| Source changed before cutting | Re-snapshot, update `source`, `check`, regenerate this file. |",
+          "| A PR merged | Delete its branch on merge; the next PR retargets to the base. Regenerate with `--prs`. |",
+          ""]
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         f.write("\n".join(L))
-    print(f"wrote {args.out}")
+    print(f"wrote {args.out} ({len(L)} lines)")
 
 
 def cmd_cut(args):
@@ -400,7 +656,7 @@ def cmd_verify(args):
 def cmd_sync(args):
     plan = Plan(args.plan)
     for pr in plan.prs[args.n:]:
-        below = plan.prs[pr["n"] - 2]["branch"]
+        below = plan.base_of(pr)
         path = worktree(pr["branch"])
         r = subprocess.run(["git", "merge", "--no-edit", below], cwd=path, capture_output=True, text=True)
         if r.returncode:
@@ -419,6 +675,7 @@ def main():
     sub.add_parser("check").set_defaults(fn=cmd_check)
     d = sub.add_parser("doc")
     d.add_argument("--out", default=".stack/STACK.md")
+    d.add_argument("--prs", action="store_true", help="look up PR numbers with gh")
     d.set_defaults(fn=cmd_doc)
     sub.add_parser("cut").set_defaults(fn=cmd_cut)
     v = sub.add_parser("verify")

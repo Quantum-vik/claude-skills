@@ -8,6 +8,10 @@ source = "a1b2c3d"                   # branch or commit holding the whole change
 branch_prefix = "feature/ABC-123-"   # branch N = <prefix><NN>-<name>
 cap = 700                            # max added + deleted lines per PR, whole-file deletions not counted
 exclude = ["config/local.py", ".env*"]   # changed paths that stay out of every PR
+stack_type = "review slices: only the top branch must run; the integration branch merges once"
+notes = """
+- PR 13 over the cap: 560 of its lines are moved code (`git diff --color-moved`).
+"""                                  # markdown rendered under "Problems and decisions"
 
 [[pr]]
 name = "data-model"                  # lowercase-dashed; part of the branch name
