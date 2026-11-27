@@ -816,7 +816,9 @@ def context(plan, with_gh):
                 found=problems(plan, edges), layer_stats=layer_stats, changes=changes, needs=needs, used_by=used_by)
 
 
-def render_card(plan, ctx, pr, heading="###"):
+def render_card(plan, ctx, pr, heading="###", for_pr=False):
+    """One PR's card. ``for_pr`` leaves out what GitHub already shows on the PR page (review state, CI, threads and
+    the per-file table), so a PR description holds only what the PR is and how it fits the stack."""
     n, s, g = pr["n"], ctx["state"].get(pr["n"]), ctx["gh"].get(pr["n"])
     stats = ctx["layer_stats"][n]
     counted, deleted = size_of(stats)
@@ -851,6 +853,8 @@ def render_card(plan, ctx, pr, heading="###"):
                 for c in s["commits"])]
     elif s and s["commits"] == []:
         L.append("- **Commits since cut:** none")
+    if for_pr:
+        return L + [""]
     if g:
         L.append(f"- **Review:** {(g.get('reviewDecision') or 'no decision').lower().replace('_', ' ')}; CI "
                  f"{ci_text(g['ci'])} ({g['ci']['pass']} pass, {g['ci']['fail']} fail, {g['ci']['pending']} pending)")
@@ -893,7 +897,7 @@ def render_body(plan, ctx, pr, limit=BODY_LIMIT):
         where_ = f"#{g_first['number']}" if g_first else f"PR {first:02d}"
         L = [BODY_START, f"**Layer {pr['n']} of {total}** in {stack_ref}. Review only this PR's diff; the stack "
              f"overview (order, decisions, how to merge) is in {where_}.", "",
-             *render_card(plan, ctx, pr, "###"), BODY_END]
+             *render_card(plan, ctx, pr, "###", for_pr=True), BODY_END]
     else:
         rows = ["| # | PR | Title | Purpose | Lines |", "|---|---|---|---|---|"]
         for other in plan.prs:
@@ -913,7 +917,7 @@ def render_body(plan, ctx, pr, limit=BODY_LIMIT):
              "", f"**Stack type:** {plan.stack_type or 'not stated'}", "", f"**Merging:** {merge_how}", "", *rows, ""]
         if plan.notes:
             L += ["### Decisions and known issues", "", plan.notes.strip(), ""]
-        L += ["## This PR", "", *render_card(plan, ctx, pr, "###"), BODY_END]
+        L += ["## This PR", "", *render_card(plan, ctx, pr, "###", for_pr=True), BODY_END]
     body = "\n".join(L)
     if len(body) > limit:
         body = body[:max(limit - 200, 0)] + "\n\n_(cut to fit GitHub's limit; the stack document has the full card)_\n" \
