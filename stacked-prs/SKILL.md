@@ -88,7 +88,8 @@ needs the official extension: `gh extension install github/gh-stack` (installing
    would fix, and that it refreshes every open PR description. Show it to the user; on their go run
    `publish --yes` (`--draft` for draft PRs). Each description gets a generated block between `<!-- stacked-prs:start/end -->` markers: the lowest open PR
    carries the stack overview (stack type, how to merge, every PR with its purpose and size, the plan's decisions)
-   plus its own card; every other PR carries only its own card and one line pointing at the overview; text the author writes outside the
+   plus its own card; every other PR carries only its own card and one line pointing at the overview; PR numbers there are written as code (`#123`) because GitHub turns every `#123` or PR link
+   in a description into a permanent "This was referenced" timeline event that no edit removes; text the author writes outside the
    markers is kept on every refresh. Re-running `publish` is safe: it only does what is missing. It refuses
    diverged branches unless `--force` (only after a `restack`), branches where origin has commits you lack, and a
    PR whose base branch is not on origin (push an integration branch first). With the gh-stack extension installed

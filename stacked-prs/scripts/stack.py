@@ -816,6 +816,12 @@ def context(plan, with_gh):
                 found=problems(plan, edges), layer_stats=layer_stats, changes=changes, needs=needs, used_by=used_by)
 
 
+def pr_ref(g, plain):
+    """A PR number for generated text. In PR descriptions it is code (`#123`): GitHub turns every #123 or PR link
+    in a description into a permanent "This was referenced" event on that PR, which no edit can remove."""
+    return f"`#{g['number']}`" if plain else f"[#{g['number']}]({g['url']})"
+
+
 def render_card(plan, ctx, pr, heading="###", for_pr=False):
     """One PR's card. ``for_pr`` leaves out what GitHub already shows on the PR page (review state, CI, threads and
     the per-file table), so a PR description holds only what the PR is and how it fits the stack."""
@@ -828,7 +834,7 @@ def render_card(plan, ctx, pr, heading="###", for_pr=False):
     L = [f"{heading} {n:02d} · {pr['name']}", "",
          f"- **Title:** {pr['title']}",
          f"- **Branch:** `{pr['branch']}` → base `{expected_base(plan, n, ctx['merged'])}`"
-         + (f" · PR [#{g['number']}]({g['url']}) {g['state'].lower()}{' (draft)' if g.get('isDraft') else ''}"
+         + (f" · PR {pr_ref(g, for_pr)} {g['state'].lower()}{' (draft)' if g.get('isDraft') else ''}"
             if g else ""),
          f"- **Size:** {counted} lines{' (over cap)' if counted > plan.cap else ''}, {deleted} in deleted files, "
          f"{len(stats)} files",
@@ -894,7 +900,7 @@ def render_body(plan, ctx, pr, limit=BODY_LIMIT):
     stack_ref = f"[GitHub stack #{plan.github_stack}]({url})" if url else (
         f"GitHub stack #{plan.github_stack}" if plan.github_stack else "this stack")
     if pr["n"] != first:
-        where_ = f"#{g_first['number']}" if g_first else f"PR {first:02d}"
+        where_ = pr_ref(g_first, True) if g_first else f"PR {first:02d}"
         L = [BODY_START, f"**Layer {pr['n']} of {total}** in {stack_ref}. Review only this PR's diff; the stack "
              f"overview (order, decisions, how to merge) is in {where_}.", "",
              *render_card(plan, ctx, pr, "###", for_pr=True), BODY_END]
@@ -902,7 +908,7 @@ def render_body(plan, ctx, pr, limit=BODY_LIMIT):
         rows = ["| # | PR | Title | Purpose | Lines |", "|---|---|---|---|---|"]
         for other in plan.prs:
             g = ctx["gh"].get(other["n"])
-            num = f"#{g['number']}" if g else "—"
+            num = pr_ref(g, True) if g else "—"
             state = " (merged)" if other["n"] in ctx["merged"] else ""
             counted, _ = size_of(ctx["layer_stats"][other["n"]])
             purpose = (other.get("purpose") or "").replace("|", "\\|").replace("\n", " ")

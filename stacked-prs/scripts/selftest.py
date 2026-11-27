@@ -2,6 +2,7 @@
 """End-to-end self-test for stack.py. Builds throwaway repos (with a local bare "origin") in a temp folder and
 exercises every command and check. No network, no GitHub. Run: python3 selftest.py  (exit 0 = all passed)."""
 import json
+import re
 import os
 import subprocess
 import sys
@@ -280,6 +281,12 @@ def main():
           and plan.prs[1]["title"] in first and "## This PR" in first)
     check("PR body: other PRs carry only their own card", "Stack overview" not in second
           and plan.prs[0]["title"] not in second and "Layer 2 of 2" in second and "overview" in second)
+    ctx["gh"] = {1: dict(number=101, url="https://example.invalid/pull/101", state="OPEN", isDraft=True),
+                 2: dict(number=102, url="https://example.invalid/pull/102", state="OPEN", isDraft=True)}
+    first, second = stack.render_body(plan, ctx, plan.prs[0]), stack.render_body(plan, ctx, plan.prs[1])
+    check("PR body: PR numbers are code, never #links", "`#101`" in first and "`#102`" in first
+          and "`#101`" in second and not re.search(r"(?<!`)#10[12]", first + second) and "/pull/" not in first + second)
+    ctx["gh"] = {}
     check("PR body: no review line or file table", "**Review:**" not in second and "| File |" not in second
           and "| File |" in "\n".join(stack.render_card(plan, ctx, plan.prs[1])))
     plan.prs[1]["purpose"] = "x" * 70000
