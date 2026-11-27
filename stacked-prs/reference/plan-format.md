@@ -8,6 +8,8 @@ source = "a1b2c3d"                   # branch or commit holding the whole change
 branch_prefix = "feature/ABC-123-"   # branch N = <prefix><NN>-<name>
 cap = 700                            # max added + deleted lines per PR, whole-file deletions not counted
 exclude = ["config/local.py", ".env*"]   # changed paths that stay out of every PR
+branch_pattern = "feature/ABC-[0-9]+-[0-9]{2}-[a-z0-9-]+"   # optional: the repo CI's branch regex
+title_pattern = "\\[ABC-[0-9]+\\] (feat|fix|chore|test): .+"                  # optional: the CI's subject regex
 stack_type = "review slices: only the top branch must run; the integration branch merges once"
 notes = """
 - PR 13 over the cap: 560 of its lines are moved code (`git diff --color-moved`).
