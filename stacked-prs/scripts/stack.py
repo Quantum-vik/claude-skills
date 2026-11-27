@@ -11,8 +11,11 @@ Subcommands (run from the repo root; the plan defaults to .stack/stack.toml):
         [--fetch]       bases, reviews, threads, CI) and the next steps
   cut                   create the PR branches with plumbing only; your checkout and working tree are untouched
   publish [--yes]       push, open missing PRs with the right base, fix wrong bases, refresh the generated block
-                        of every PR description (dry run without --yes; --draft, --force after a restack)
+                        of every PR description, and link the PRs as a GitHub stack when the gh-stack extension is
+                        installed (dry run without --yes; --draft, --force after a restack)
   restack --from N      after a squash/rebase merge: replay PRs N..top onto the new base (dry run without --yes)
+  pull [--yes]          take branches that origin rewrote (GitHub rebasing a linked stack after a merge, or a
+                        restack elsewhere) when the local branch has no commits of its own (dry run without --yes)
   verify --cmd CMD      run CMD in a temporary worktree of each branch and report pass/fail (--timeout S)
   sync N                merge branch N into N+1, N+1 into N+2, ... up to the top (stops on a conflict)
 """
@@ -66,6 +69,7 @@ class Plan:
                 self.cut = json.load(f)
         self.use_ref(self.source)
         self.settle_pending_restack()
+        self.github_stack = (self.cut or {}).get("github_stack")
 
     def settle_pending_restack(self):
         pending = (self.cut or {}).get("pending_restack", {})
@@ -568,6 +572,32 @@ def first_commit(base, head):
     return commits[0] if commits else base
 
 
+def has_gh_stack():
+    return shutil.which("gh") is not None and subprocess.run(
+        ["gh", "stack", "--version"], capture_output=True).returncode == 0
+
+
+def own_commits(local, remote):
+    """Local commits whose change is not on the remote branch (by patch id): what a rewrite of origin would lose."""
+    return [line[2:] for line in git("cherry", remote, local).splitlines() if line.startswith("+ ")]
+
+
+def link_stack(plan, numbers, base):
+    """Create or update the GitHub stack. Always pass --base: without it gh-stack retargets the bottom PR to the
+    repository default branch, and GitHub then refuses to move a stacked bottom PR back (HTTP 422)."""
+    r = subprocess.run(["gh", "stack", "link", "--base", base, *map(str, numbers)], capture_output=True, text=True)
+    out = (r.stdout + r.stderr).strip()
+    match = re.search(r"stack #(\d+)", out)
+    if r.returncode or "failed" in out.lower():
+        print(f"gh stack link reported a problem:\n{out}")
+    if match:
+        cut = plan.cut or {}
+        cut["github_stack"] = int(match.group(1))
+        save_cut(plan, cut)
+        print(f"GitHub stack #{match.group(1)} linked ({len(numbers)} PRs, base {base})")
+    return r.returncode == 0
+
+
 def gh_base(ref):
     """GitHub branch name for a local ref name such as origin/main or refs/remotes/origin/main."""
     for prefix in ("refs/remotes/origin/", "refs/heads/", "origin/"):
@@ -694,9 +724,13 @@ def next_steps(plan, state, gh):
         head = state[n]["head"]
         if head and not is_ancestor(head, plan.base):
             nxt = next((m for m in range(n + 1, len(plan.prs) + 1) if m not in merged), None)
-            steps.append(f"PR {n:02d} was squash- or rebase-merged (its commits are not in `{plan.base}`; fetch first "
-                         "if unsure)" + (f" → `restack --from {nxt}`, then `publish --force`." if nxt else
-                                         "; nothing above it to restack."))
+            if plan.github_stack:
+                steps.append(f"PR {n:02d} was squash- or rebase-merged; GitHub stack #{plan.github_stack} rebases the "
+                             "PRs above by itself → `status --fetch`, then `pull` to take the rebased branches.")
+            else:
+                steps.append(f"PR {n:02d} was squash- or rebase-merged (its commits are not in `{plan.base}`; fetch "
+                             "first if unsure)" + (f" → `restack --from {nxt}`, then `publish --force`." if nxt else
+                                                   "; nothing above it to restack."))
         elif state[n]["local"]:
             steps.append(f"PR {n:02d} merged → delete the local branch when done: `git branch -d {plan.prs[n - 1]['branch']}`.")
     for pr in plan.prs:
@@ -715,9 +749,13 @@ def next_steps(plan, state, gh):
         if s["local"] and not s["remote"]:
             steps.append(f"PR {n:02d}: not pushed → `publish` (dry run first).")
         elif s["unpushed"] and s["remote_ahead"]:
-            steps.append(f"PR {n:02d}: local and origin diverged ({s['unpushed']} vs {s['remote_ahead']} commits): "
-                         "merge origin into the local branch, or `publish --force` only if origin's commits are "
-                         "obsolete (after a restack).")
+            if not own_commits(s["local"], s["remote"]):
+                steps.append(f"PR {n:02d}: origin was rewritten (GitHub rebased the stack, or a restack elsewhere) and "
+                             "the local branch has nothing of its own → `pull`.")
+            else:
+                steps.append(f"PR {n:02d}: local and origin diverged ({s['unpushed']} vs {s['remote_ahead']} "
+                             "commits) and the local branch has its own changes: merge origin into it, or "
+                             "`publish --force` only if origin's commits are obsolete (after a restack).")
         elif s["unpushed"]:
             steps.append(f"PR {n:02d}: {s['unpushed']} unpushed commit(s) → `publish`.")
         elif s["remote_ahead"]:
@@ -928,6 +966,11 @@ def cmd_doc(args):
     total_kept = sum(size_of(ctx["layer_stats"][pr["n"]])[0] for pr in plan.prs)
     total_deleted = sum(size_of(ctx["layer_stats"][pr["n"]])[1] for pr in plan.prs)
     run = f"python3 {SELF} --plan {plan.path}"
+    stack_url = ""
+    if plan.github_stack and gh_ok():
+        repo_url = subprocess.run(["gh", "repo", "view", "--json", "url", "--jq", ".url"], capture_output=True,
+                                  text=True).stdout.strip()
+        stack_url = f"{repo_url}/stack/{plan.github_stack}" if repo_url else ""
     cut_branches = sum(1 for s in state.values() if s["head"])
     if state:
         mode = (f"**branches** (cut {plan.cut['date']} from `{plan.cut['source'][:12]}`); every card below is "
@@ -961,6 +1004,7 @@ def cmd_doc(args):
          "| Item | Value |", "|---|---|",
          f"| Mode | {mode} |",
          f"| Base (PR 01 targets) | `{plan.base}` |",
+         f"| GitHub stack | {f'#{plan.github_stack}' + (f' ({stack_url})' if stack_url else '') if plan.github_stack else 'not linked (PRs are chained by base only)'} |",
          f"| Fork point | `{plan.fork[:12]}` |",
          f"| Planned source | `{plan.source}` → `{ctx['snapshot_sha'][:12]}` |",
          f"| Whole change now | `{plan.source_sha[:12]}`: {len(plan.changed)} files "
@@ -977,8 +1021,12 @@ def cmd_doc(args):
         g = gh.get(pr["n"])
         L.append(f"{'     ' * i} └── {pr['branch']}   PR {pr['n']:02d}" + (f" #{g['number']}" if g else "")
                  + (" (merged)" if pr["n"] in merged else ""))
-    L += ["```", "", "Merge bottom-up with merge commits (not squash). With \"delete branch on merge\", GitHub retargets "
-          "the next PR to the base by itself.", "", "## Stack map", "",
+    merge_note = ("Linked as a GitHub stack: merge from the stack map in any PR's merge box. Merging a PR also merges "
+                  "every PR below it; merge commit, squash and rebase all work, and GitHub retargets and rebases the "
+                  "PRs above by itself (then run `pull`)." if plan.github_stack else
+                  "Merge bottom-up with merge commits (not squash). With \"delete branch on merge\", GitHub retargets "
+                  "the next PR to the base by itself.")
+    L += ["```", "", merge_note, "", "## Stack map", "",
           "| # | PR | Branch | Title | Lines | Deleted | Lands after | Since cut | In sync | Pushed | Review | CI |",
           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for pr in plan.prs:
@@ -1033,7 +1081,9 @@ def cmd_doc(args):
           "it (`git merge --no-edit <base>`), then `sync` from there. |",
           "| A PR merged (merge commit) | Delete its branch on merge; the next PR retargets to the base. "
           "`status --prs` confirms. |",
-          f"| A PR was squash- or rebase-merged | `{run} restack --from <next PR>` (dry run, then `--yes`), then "
+          f"| GitHub rebased the stack (linked stack, after a merge) | `{run} status --fetch`, then `{run} pull` "
+          "(dry run, then `--yes`) to take the rebased branches. |",
+          f"| A PR was squash- or rebase-merged (stack not linked) | `{run} restack --from <next PR>` (dry run, then `--yes`), then "
           "`publish --force --yes`. |",
           ""]
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -1113,6 +1163,17 @@ def cmd_publish(args):
     print("Fix base:", *([f"  #{g['number']} {g['baseRefName']} → {b}" for p, g, b in retargets] or ["  none"]),
           sep="\n")
     print(f"Refresh the generated block in every open PR description ({len(plan.prs) - len(merged)} PRs).")
+    open_prs = [pr for pr in plan.prs if pr["n"] not in merged]
+    stack_base = expected_base(plan, open_prs[0]["n"], merged) if open_prs else gh_base(plan.base)
+    linkable = has_gh_stack()
+    if linkable:
+        print(f"Link as a GitHub stack: gh stack link --base {stack_base} <{len(open_prs)} PRs, bottom to top>"
+              + (f" (updates stack #{plan.github_stack})" if plan.github_stack else ""))
+        if retargets and plan.github_stack:
+            print(f"  base fixes inside a linked stack: unstack #{plan.github_stack}, fix the bases, link again")
+    else:
+        print("GitHub stack: not linked (install `gh extension install github/gh-stack` to get the stack map and "
+              "stack-aware merging)")
     if skipped:
         print("Skipped:", *(f"  {x}" for x in skipped), sep="\n")
     if problems_:
@@ -1133,10 +1194,17 @@ def cmd_publish(args):
         if r.returncode:
             sys.exit(f"gh pr create failed for {pr['branch']}: {r.stderr.strip()}")
         print(f"opened {r.stdout.strip()}")
+    if retargets and plan.github_stack and linkable:
+        subprocess.run(["gh", "stack", "unstack", str(plan.github_stack)], check=True, capture_output=True)
+        print(f"unstacked #{plan.github_stack} to fix bases")
     for pr, g, base in retargets:
         subprocess.run(["gh", "pr", "edit", str(g["number"]), "--base", base], check=True, capture_output=True)
         print(f"#{g['number']} now targets {base}")
     ctx = context(Plan(args.plan), True)  # fresh numbers for every stack map
+    if linkable and open_prs:
+        numbers = [ctx["gh"][pr["n"]]["number"] for pr in open_prs if pr["n"] in ctx["gh"]]
+        link_stack(plan, numbers, stack_base)
+        ctx = context(Plan(args.plan), True)
     for pr in plan.prs:
         g = ctx["gh"].get(pr["n"])
         if not g or g["state"] != "OPEN":
@@ -1249,6 +1317,52 @@ def cmd_restack(args):
     return 0
 
 
+def checked_out_branches():
+    out = set()
+    for line in git("worktree", "list", "--porcelain").splitlines():
+        if line.startswith("branch refs/heads/"):
+            out.add(line[len("branch refs/heads/"):])
+    return out
+
+
+def cmd_pull(args):
+    """Take origin's version of branches that were rewritten there, when nothing local would be lost."""
+    plan = Plan(args.plan)
+    git("fetch", "--quiet", "origin")
+    state = branch_state(plan)
+    busy = checked_out_branches()
+    takes, blocked = [], []
+    for pr in plan.prs:
+        s = state.get(pr["n"]) or {}
+        if not s.get("local") or not s.get("remote") or not s["remote_ahead"]:
+            continue
+        mine = own_commits(s["local"], s["remote"])
+        if mine:
+            blocked.append(f"PR {pr['n']:02d}: {len(mine)} local commit(s) not on origin; merge origin into the branch")
+        elif pr["branch"] in busy:
+            blocked.append(f"PR {pr['n']:02d}: {pr['branch']} is checked out in a worktree; update it there "
+                           f"(`git merge --ff-only` or `git reset --keep origin/{pr['branch']}`)")
+        else:
+            takes.append(pr)
+    print("Take origin's branch:", *([f"  {p['branch']}" for p in takes] or ["  nothing"]), sep="\n")
+    if blocked:
+        print("Left alone:", *(f"  {x}" for x in blocked), sep="\n")
+    if not args.yes:
+        print("\nDry run. Re-run with --yes on the user's go.")
+        return 0
+    cut = plan.cut or dict(date="", source=plan.source_sha, fork=plan.fork, branches={})
+    for pr in takes:
+        s = state[pr["n"]]
+        git("update-ref", f"refs/heads/{pr['branch']}", s["remote"], s["local"])
+        below = plan.base if pr["n"] == 1 else ref_of(plan.prs[pr["n"] - 2]["branch"]) or plan.base
+        cut.setdefault("branches", {})[pr["branch"]] = first_commit(git("merge-base", below, s["remote"]).strip(),
+                                                                    s["remote"])
+        print(f"{pr['n']:02d} {pr['branch']}: {s['local'][:10]} → {s['remote'][:10]}")
+    if takes:
+        save_cut(plan, cut)
+    return 0
+
+
 def cmd_verify(args):
     plan, failed = Plan(args.plan), []
     for pr in plan.prs[args.start - 1:]:
@@ -1304,6 +1418,9 @@ def main():
     pb.add_argument("--draft", action="store_true", help="open new PRs as drafts")
     pb.add_argument("--force", action="store_true", help="force-with-lease diverged branches (after a restack)")
     pb.set_defaults(fn=cmd_publish)
+    pl = sub.add_parser("pull")
+    pl.add_argument("--yes", action="store_true")
+    pl.set_defaults(fn=cmd_pull)
     rs = sub.add_parser("restack")
     rs.add_argument("--from", dest="start", type=int, required=True, help="first PR to move")
     rs.add_argument("--onto", help="new base for that PR (default: the stack base)")

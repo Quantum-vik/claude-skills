@@ -1,6 +1,6 @@
 ---
 name: stacked-prs
-description: Split one large change (a staged index, a branch or a commit) into a stack of small dependent PRs, each under a line cap, and keep the stack healthy afterwards. Plans the layers, checks Python import order and dependency cycles between PRs, writes the stack document (map, per-PR cards, file-to-PR index, change procedure), cuts the branches without touching the working tree, verifies each branch, publishes the PRs with the right bases and generated descriptions, merges fixes upward, restacks after a squash merge, and tracks the stack after the cut (commits per PR, sync and push state, drift from the plan, merged PRs and bases, review decisions, unresolved review threads, CI). Use when asked for stacked PRs, to split a big PR or feature into smaller PRs, to plan PRs under N lines, or to fix, restack, document or check the status of an existing stack, or to handle review comments on stacked PRs.
+description: Split one large change (a staged index, a branch or a commit) into a stack of small dependent PRs, each under a line cap, and keep the stack healthy afterwards. Plans the layers, checks Python import order and dependency cycles between PRs, writes the stack document (map, per-PR cards, file-to-PR index, change procedure), cuts the branches without touching the working tree, verifies each branch, publishes the PRs with the right bases and generated descriptions, merges fixes upward, restacks after a squash merge, links the PRs as a native GitHub stack (gh-stack) and takes branches GitHub rebased, and tracks the stack after the cut (commits per PR, sync and push state, drift from the plan, merged PRs and bases, review decisions, unresolved review threads, CI). Use when asked for stacked PRs, to split a big PR or feature into smaller PRs, to plan PRs under N lines, or to fix, restack, document or check the status of an existing stack, or to handle review comments on stacked PRs.
 ---
 
 # Stacked PRs
@@ -19,12 +19,13 @@ Kit (paths relative to this skill's folder, `~/.claude/skills/stacked-prs/`):
 
 | File | Role |
 |---|---|
-| `scripts/stack.py` | `snapshot`, `init`, `check`, `doc`, `status`, `cut`, `publish`, `restack`, `verify`, `sync` (run with `--help`) |
+| `scripts/stack.py` | `snapshot`, `init`, `check`, `doc`, `status`, `cut`, `publish`, `pull`, `restack`, `verify`, `sync` (run with `--help`) |
 | `scripts/selftest.py` | End-to-end test of every command on throwaway repos (no network). Run after any edit to `stack.py` |
 | `reference/plan-format.md` | The plan file (`.stack/stack.toml`) and how paths match |
 | `reference/fixing.md` | How to resolve order problems, cycles, migrations and over-cap PRs |
 
-Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `gh`.
+Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `gh`. Linking the PRs as a GitHub stack
+needs the official extension: `gh extension install github/gh-stack` (installing it needs the user's go).
 
 ## Ground rules
 
@@ -88,7 +89,27 @@ Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `
    `publish --yes` (`--draft` for draft PRs). Each description gets a generated block (the stack list with this PR
    marked, plus its card) between `<!-- stacked-prs:start/end -->` markers; text the author writes outside the
    markers is kept on every refresh. Re-running `publish` is safe: it only does what is missing. It refuses
-   diverged branches unless `--force` (only after a `restack`) and branches where origin has commits you lack.
+   diverged branches unless `--force` (only after a `restack`), branches where origin has commits you lack, and a
+   PR whose base branch is not on origin (push an integration branch first). With the gh-stack extension installed
+   it then links the open PRs as a **GitHub stack** (`gh stack link --base <bottom base> <PRs>`) and records the
+   stack number in `cut.json`.
+
+## GitHub stacks (native)
+
+GitHub supports stacked PRs natively (docs.github.com → Pull requests → Stacked pull requests): each PR shows a
+stack icon with its layer and the merge box shows a stack map; merging a PR also merges every PR below it; merge
+commit, squash and rebase all work, and GitHub retargets and **rebases** the PRs above by itself. Required reviews
+and checks come from the bottom PR's base branch. No repository setting is needed.
+
+- **Always pass `--base`** to `gh stack link`: without it the bottom PR is retargeted to the repository's default
+  branch, and GitHub then refuses to move a stacked bottom PR back (HTTP 422). To change a base inside a linked
+  stack: `gh stack unstack <n>`, `gh pr edit --base`, link again (`publish` does this).
+- After GitHub rebases the stack (a merge), origin's branches are rewritten: `status --fetch` reports "origin was
+  rewritten", and `pull` (dry run, then `--yes`) takes origin's branch when the local one has no commits of its own
+  (compared by patch id); a branch with local-only commits is left alone. A branch checked out in a worktree is
+  updated there by hand.
+- `sync` still **merges** fixes upward (no rebase). gh-stack's own `gh stack sync` / `rebase` rebase instead and
+  need its local tracking and a checkout of the branch; use them only if the user prefers rebasing.
 
 ## Picking up an existing stack (new session)
 
@@ -133,7 +154,9 @@ Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `
   it is fine (for example a one-line fix carried in a later PR). Regenerate.
 - **Merging:** bottom-up, with merge commits. With "delete branch on merge", GitHub retargets the next PR to the
   base; `status --prs` confirms or `publish` fixes the base. Delete merged local branches when done.
-- **Squash or rebase merge happened anyway:** `stack.py restack --from <next PR>` (dry run, then `--yes`) replays
+- **Squash or rebase merge in a linked GitHub stack:** fine; GitHub rebases the PRs above. Then `status --fetch`
+  and `pull`.
+- **Squash or rebase merge happened anyway (stack not linked):** `stack.py restack --from <next PR>` (dry run, then `--yes`) replays
   each remaining branch's own commits onto the new base in temporary worktrees, stops on a conflict with the
   command to continue, and updates `cut.json`; then `publish --force` (dry run first) pushes with
   `--force-with-lease`.

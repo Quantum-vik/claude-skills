@@ -231,6 +231,32 @@ def main():
     check("restack: PR 02 now shows only its own files", "pkg/a.py" not in own and "pkg/c.py" in own, own)
     check("restack: content kept", sh("git", "show", f"{b2}:pkg/c.py").stdout == "from pkg.b import X\nY = X + 2\n")
 
+    # 10b) origin rewritten with the same changes (as GitHub does when it rebases a linked stack) -> pull takes it
+    sh("git", "push", "-q", "--force", "origin", f"{b2}:{b2}")
+    sh("git", "-C", other, "fetch", "-q", "origin")
+    sh("git", "-C", other, "checkout", "-q", "-B", b2, f"origin/{b2}")
+    sh("git", "-C", other, "commit", "-q", "--amend", "--no-edit", "--date=2001-01-01T00:00:00")
+    sh("git", "-C", other, "push", "-q", "--force", "origin", b2)
+    out = st("status", "--fetch")
+    check("status: rewritten origin detected", "origin was rewritten" in out and "→ `pull`" in out, out)
+    out = st("pull")
+    check("pull: dry run lists the branch", "Dry run" in out and b2 in out, out)
+    st("pull", "--yes")
+    check("pull: local now equals origin", sh("git", "rev-parse", b2).stdout == sh("git", "rev-parse",
+                                                                                     f"origin/{b2}").stdout)
+    wt = os.path.join(tmp, "wt4")
+    sh("git", "worktree", "add", "-q", wt, b2)
+    write(os.path.join(wt, "pkg/e.py"), "E = 1\n")
+    sh("git", "add", "-A", cwd=wt)
+    sh("git", "commit", "-qm", "feat: local only", cwd=wt)
+    sh("git", "worktree", "remove", wt)
+    sh("git", "-C", other, "commit", "-q", "--amend", "--no-edit", "--date=2002-01-01T00:00:00")
+    sh("git", "-C", other, "push", "-q", "--force", "origin", b2)
+    sh("git", "fetch", "-q", "origin")
+    out = st("pull", "--yes")
+    check("pull: keeps a branch with local-only commits", "1 local commit(s) not on origin" in out
+          and "feat: local only" in sh("git", "log", "-1", "--format=%s", b2).stdout, out)
+
     # 11) unit pieces: next steps for merged / squash / order / base mismatch, PR body merge and size cap
     os.chdir(os.path.join(tmp, "work"))
     plan = stack.Plan(".stack/stack.toml")
