@@ -897,8 +897,8 @@ def render_body(plan, ctx, pr, limit=BODY_LIMIT):
     g_first = ctx["gh"].get(first)
     total = len(plan.prs)
     url = ctx.get("stack_url") or ""
-    stack_ref = f"[GitHub stack #{plan.github_stack}]({url})" if url else (
-        f"GitHub stack #{plan.github_stack}" if plan.github_stack else "this stack")
+    stack_ref = f"[GitHub stack `#{plan.github_stack}`]({url})" if url else (
+        f"GitHub stack `#{plan.github_stack}`" if plan.github_stack else "this stack")
     if pr["n"] != first:
         where_ = pr_ref(g_first, True) if g_first else f"PR {first:02d}"
         L = [BODY_START, f"**Layer {pr['n']} of {total}** in {stack_ref}. Review only this PR's diff; the stack "
