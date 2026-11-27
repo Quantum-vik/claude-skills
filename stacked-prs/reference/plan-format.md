@@ -31,6 +31,8 @@ paths = ["app/models.py", "app/migrations/0008*", "app/engine/"]
 | `app/engine/` (trailing slash) | everything under the folder |
 | `app/migrations/0008*`, `tests/test_*.py` | shell-style glob (`fnmatch`; `*` also crosses `/`) |
 
+A path always matches itself exactly, even when it contains glob characters such as `[1]`.
+
 A file belongs to the PR with the **longest** matching pattern, so a folder can go to one PR while single files
 inside it go to others. An `exclude` match wins over everything. Every changed file must match something;
 `check` lists the ones that don't.
@@ -38,5 +40,6 @@ inside it go to others. An `exclude` match wins over everything. Every changed f
 ## How sizes are counted
 
 `git diff --numstat --no-renames <fork> <source>`: for files that still exist, added + deleted lines count
-against the cap; a deleted file's lines are reported separately and not counted. A rename is a delete plus an
-add.
+against the cap; a deleted file's lines are reported separately and not counted. A rename git detects (`-M`,
+50% similarity) counts once, with only its edits, and both of its paths must sit in the same PR (`check` reports a
+split). A rewrite below that similarity is a delete plus an add.

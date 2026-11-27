@@ -44,11 +44,16 @@ def write(path, text):
 
 
 def plan_file(source, prs, extra=""):
-    body = [f'base = "main"', f'source = "{source}"', 'branch_prefix = "stack/t-"', "cap = 50",
-            'exclude = ["local.cfg"]', extra, ""]
+    body = ['base = "main"', f'source = "{source}"', 'branch_prefix = "stack/t-"', "cap = 50",
+            'exclude = ["local.cfg", "docs/*.md"]', extra, ""]
     for name, title, paths in prs:
         body += ["[[pr]]", f'name = "{name}"', f'title = "{title}"', f"paths = {json.dumps(paths)}", ""]
     write(".stack/stack.toml", "\n".join(body))
+
+
+def stack_plan():
+    stack.RENAMED.clear()
+    return stack.Plan(".stack/stack.toml")
 
 
 def repo(root):
@@ -76,6 +81,8 @@ def main():
     write("pkg/b.py", "from pkg.a import old\nX = old()\n")
     write("pkg/moveme.py", "def helper():\n    return 'h'\n")
     write("local.cfg", "x\n")
+    write("docs/v1.txt", "one\n")
+    write("docs/sub/a.md", "a\n")
     sh("git", "add", "-A")
     sh("git", "commit", "-qm", "init")
     sh("git", "push", "-q", "origin", "main")
@@ -88,6 +95,9 @@ def main():
     write("app/migrations/0003_more.py", "dependencies = [('app', '0002_add')]\n")
     sh("git", "mv", "pkg/moveme.py", "pkg/moved.py")
     write("local.cfg", "y\n")
+    write("pkg/café.py", "Z = 'ü'\n")          # non-ASCII path
+    write("docs/v[1].txt", "bracket\n")        # looks like a pathspec glob
+    write("docs/sub/a.md", "changed\n")        # excluded through a glob that crosses folders
     sh("git", "add", "-A")
     snap = st("snapshot").strip()
     check("snapshot returns a commit", len(snap) == 40 and sh("git", "cat-file", "-t", snap).stdout.strip() == "commit")
@@ -109,7 +119,8 @@ def main():
 
     # 2) a good plan
     plan_file(snap, [("core", "feat: swap a and b", ["pkg/a.py", "pkg/b.py", "app/migrations/0002_add.py",
-                                                     "pkg/moveme.py", "pkg/moved.py"]),
+                                                     "pkg/moveme.py", "pkg/moved.py", "pkg/café.py",
+                                                     "docs/v[1].txt"]),
                      ("extra", "feat: c and more", ["pkg/c.py", "app/migrations/0003*"])],
               extra='branch_pattern = "stack/t-\\\\d\\\\d-[a-z]+"\ntitle_pattern = "(feat|fix): .+"')
     out = st("check")
@@ -124,6 +135,13 @@ def main():
     out = st("cut")
     check("cut: top equals source", "top branch == source" in out, out)
     check("cut: records cut.json", os.path.exists(".stack/cut.json"))
+    check("cut: non-ASCII path carried", sh("git", "show", "stack/t-01-core:pkg/café.py").stdout == "Z = 'ü'\n")
+    check("cut: bracket path taken literally", sh("git", "show", "stack/t-01-core:docs/v[1].txt").stdout == "bracket\n"
+          and sh("git", "show", "stack/t-01-core:docs/v1.txt").stdout == "one\n")
+    check("cut: excluded glob not reported as mismatch", "MISMATCH" not in out, out)
+    renamed = stack_plan().changed
+    check("rename counted once", renamed["pkg/moved.py"][0] == "R" and renamed["pkg/moveme.py"][1:3] == (0, 0),
+          renamed.get("pkg/moved.py"))
     check("cut: working tree untouched", "local.cfg" in sh("git", "status", "--short").stdout)
     st("cut", ok=False)
     PASSED.append("cut: refuses to overwrite branches")
@@ -198,10 +216,17 @@ def main():
     sh("git", "merge", "-q", "--squash", b1)
     sh("git", "commit", "-qm", "feat: swap a and b (squashed)")
     old_b2 = sh("git", "rev-parse", b2).stdout.strip()
+    layer2 = stack.branch_state(stack_plan(), frozenset({1}))[2]["stats"]
+    check("squash-merged PR 01: PR 02 still measured from PR 01", "pkg/a.py" not in layer2 and "pkg/c.py" in layer2,
+          sorted(layer2))
     out = st("restack", "--from", "2")
     check("restack: dry run by default", "Dry run" in out and sh("git", "rev-parse", b2).stdout.strip() == old_b2, out)
     out = st("restack", "--from", "2", "--yes")
     check("restack: rewrites PR 02", "02 stack/t-02-extra:" in out, out)
+    check("restack: content guard quiet when nothing was lost", "content differs" not in out, out)
+    since = stack.branch_state(stack_plan(), frozenset({1}))[2]["commits"]
+    check("restack: commits since cut stay the PR's own", [c["subject"] for c in since] == [
+        "feat: extra", "fix: teammate change"], since)
     own = sh("git", "diff", "--name-only", "main...stack/t-02-extra").stdout.split()
     check("restack: PR 02 now shows only its own files", "pkg/a.py" not in own and "pkg/c.py" in own, own)
     check("restack: content kept", sh("git", "show", f"{b2}:pkg/c.py").stdout == "from pkg.b import X\nY = X + 2\n")
@@ -227,7 +252,19 @@ def main():
     ctx["changes"][2] = {p: ["x" * 5000] * 20 for p in ctx["layer_stats"][2]}
     body = stack.render_body(plan, ctx, plan.prs[1])
     check("PR body: cut to GitHub's limit", len(body) <= stack.BODY_LIMIT and body.endswith(stack.BODY_END))
+    steps = "\n".join(stack.next_steps(plan, stack.branch_state(plan, frozenset({2})),
+                                       {2: dict(state="MERGED", number=2, baseRefName=b1, threads=[], ci={})}))
+    check("next steps: wrong order with an unopened lower PR", "merged while a lower PR is still open" in steps, steps)
+    tree = stack.Tree({"x.py": "def (:\n"})
+    names, star, imports = tree.info("x.py")
+    check("syntax error: no names, no star, reported", not names and not star and tree.bad == {"x.py"})
+    big = stack.BODY_START + "\n" + "y" * 70000 + "\n" + stack.BODY_END
+    fitted = stack.fitted_body(plan, ctx, plan.prs[1], "author notes " * 2000 + big)
+    check("PR body: whole description within GitHub's limit", len(fitted) <= 65536 and "author notes" in fitted)
     generated = f"{stack.BODY_START}\nnew\n{stack.BODY_END}"
+    tricky = f"see {stack.BODY_END} below\n{stack.BODY_START}\nold\n{stack.BODY_END}\ntail"
+    check("PR body: markers matched in order", stack.merge_body(tricky, generated)
+          == f"see {stack.BODY_END} below\n{generated}\ntail")
     check("PR body: keeps author text", stack.merge_body(f"intro\n{stack.BODY_START}\nold\n{stack.BODY_END}\nouttro",
                                                          generated) == f"intro\n{generated}\nouttro")
     check("PR body: appends when no block", stack.merge_body("intro", generated) == f"intro\n\n{generated}")

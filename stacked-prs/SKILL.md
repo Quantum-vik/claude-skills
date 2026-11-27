@@ -150,6 +150,9 @@ Needs `git` and `python3` ≥ 3.11 (stdlib only). Pushing and PR creation need `
 - It sees module and top-level names, not changed signatures, string references (settings, URL includes, task
   names, dependency-injection keys) or database schema. Django migration dependencies are checked assuming the
   default app label (the folder that holds `migrations/`); schema rules are in `reference/fixing.md`.
+- `restack` replays each branch's own commits; a conflict fix that existed only in a `sync` merge commit is not
+  replayed. It compares every branch's content before and after and warns when stack files changed, so check that
+  warning. A restack stopped by a conflict is resumable with the command it prints.
 - Review threads: the first 100 per PR, and only each thread's first comment.
 - Two sessions must not run `sync`, `restack` or `publish` on the same stack at the same time.
 

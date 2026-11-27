@@ -36,7 +36,7 @@ SELF = os.path.abspath(__file__)
 
 
 def git(*args, env=None, check=True):
-    r = subprocess.run(["git", *args], capture_output=True, env=env)
+    r = subprocess.run(["git", "-c", "core.quotePath=false", *args], capture_output=True, env=env)
     if check and r.returncode:
         sys.exit(f"git {' '.join(args)} failed: {r.stderr.decode().strip()}")
     return r.stdout.decode("utf-8", "replace")
@@ -65,11 +65,22 @@ class Plan:
             with open(self.cut_path) as f:
                 self.cut = json.load(f)
         self.use_ref(self.source)
+        self.settle_pending_restack()
+
+    def settle_pending_restack(self):
+        pending = (self.cut or {}).get("pending_restack", {})
+        for branch, new_base in list(pending.items()):
+            head = git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).strip()
+            if head and is_ancestor(new_base, head):
+                self.cut["branches"][branch] = first_commit(new_base, head)
+                del pending[branch]
+                with open(self.cut_path, "w") as f:
+                    json.dump(self.cut, f, indent=1)
 
     def use_ref(self, ref):
         """Describe the change as fork point -> ref (the snapshot before cutting, the top branch after)."""
         self.source_sha = git("rev-parse", ref).strip()
-        self.fork = self.cut["fork"] if self.cut else git("merge-base", self.base, self.source_sha).strip()
+        self.fork = git("merge-base", self.base, self.source_sha).strip()
         self.changed = diff_stats(self.fork, self.source_sha)
 
     def pr_of(self, path):
@@ -100,8 +111,14 @@ class Plan:
         return self.base if pr["n"] == 1 else self.prs[pr["n"] - 2]["branch"]
 
 
+RENAMED = {}  # new path -> old path, from the last diff_stats calls
+
+
 def diff_stats(a, b):
-    """path -> (status letter, added, deleted, binary) for the diff a..b."""
+    """path -> (status letter, added, deleted, binary) for the diff a..b.
+
+    Paths are listed without rename pairing (so cut can add and delete them), but a detected rename counts once:
+    the new path gets status R with the rename's own +/- lines and the old path is a D with 0 lines."""
     stats, out = {}, {}
     for line in git("diff", "--numstat", "--no-renames", a, b).splitlines():
         x, y, p = line.split("\t", 2)
@@ -109,6 +126,22 @@ def diff_stats(a, b):
     for line in git("diff", "--name-status", "--no-renames", a, b).splitlines():
         st, p = line.split("\t", 1)
         out[p] = (st[0], *stats.get(p, (0, 0, False)))
+    raw = git("diff", "-M", "--numstat", "-z", a, b).split("\0")
+    k = 0
+    while k < len(raw) - 1:
+        if not raw[k]:
+            k += 1
+            continue
+        x, y, path = raw[k].split("\t", 2)
+        if path == "" and k + 2 < len(raw):  # rename: "add\tdel\t" NUL old NUL new
+            old, new = raw[k + 1], raw[k + 2]
+            if old in out and new in out:
+                out[new] = ("R", int(x) if x != "-" else 0, int(y) if y != "-" else 0, x == "-")
+                out[old] = ("D", 0, 0, False)
+                RENAMED[new] = old
+            k += 3
+        else:
+            k += 1
     return out
 
 
@@ -153,6 +186,7 @@ class Tree:
         self.mods = {modname(p): p for p in files}
         self.dirs = {".".join(p.split("/")[:i]) for p in files for i in range(1, p.count("/") + 1)}
         self._info = {}
+        self.bad = set()
 
     def info(self, path):
         """(top-level names, has star import, [(module, name|None)])."""
@@ -161,7 +195,8 @@ class Tree:
         try:
             tree = ast.parse(self.files[path])
         except SyntaxError:
-            self._info[path] = (set(), True, [])
+            self.bad.add(path)
+            self._info[path] = (set(), False, [])
             return self._info[path]
         names, star = set(), False
 
@@ -239,7 +274,9 @@ def constraints(plan, old, new):
                     edges.append((b, a, what, f"new {a} imports {what}, which only exists after {b} changes"))
                 else:  # old a needs something the new b removes -> a must change no later than b
                     edges.append((a, b, what, f"old {a} imports {what}, which {b} removes"))
-    return edges + migration_edges(plan, new)
+    edges += migration_edges(plan, new)
+    plan.syntax_errors = sorted(p for p in (old.bad | new.bad) if p in plan.changed)
+    return edges
 
 
 MIGRATION = re.compile(r"(^|/)migrations/\d{4}_\w+\.py$")
@@ -341,6 +378,7 @@ def problems(plan, edges):
             out.append(f"BRANCH NAME RULE: {pr['branch']} does not match {plan.branch_pattern}")
         if plan.title_pattern and not re.fullmatch(plan.title_pattern, pr["title"]):
             out.append(f"TITLE RULE: PR {pr['n']:02d} \"{pr['title']}\" does not match {plan.title_pattern}")
+    out += [f"SYNTAX ERROR (imports not checked): {p}" for p in getattr(plan, "syntax_errors", [])]
     for comp in cycles(plan.changed, edges):
         prs = sorted({plan.pr_of(p) for p in comp if plan.pr_of(p)})
         if len(prs) > 1:
@@ -424,6 +462,8 @@ def describe(changed, old_src, new_src):
             summary[p] = ["binary file"]
             continue
         old, new = old_src.get(p), new_src.get(p)
+        if st == "R" and old is None:
+            old = old_src.get(RENAMED.get(p, ""))
         if p.endswith(".py"):
             parsed[p] = (symbols(old) if old is not None else ({}, set()),
                          symbols(new) if new is not None else ({}, set()))
@@ -439,6 +479,12 @@ def describe(changed, old_src, new_src):
             continue
         old, new = old_src.get(p), new_src.get(p)
         lines = []
+        if st == "R" and old is None and RENAMED.get(p) in old_src:
+            old = old_src[RENAMED[p]]
+            lines.append(f"renamed from `{RENAMED[p]}`")
+        if st == "D" and a == d == 0 and p in RENAMED.values():
+            summary[p] = [f"renamed to `{next(k for k, v in RENAMED.items() if v == p)}`"]
+            continue
         if p not in parsed or parsed[p][0][0] is None or parsed[p][1][0] is None:
             if old is None:
                 lines.append(f"new file, {len((new or '').splitlines())} lines")
@@ -516,6 +562,12 @@ def is_ancestor(a, b):
     return subprocess.run(["git", "merge-base", "--is-ancestor", a, b], capture_output=True).returncode == 0
 
 
+def first_commit(base, head):
+    """First commit of base..head (the replayed layer commit after a rebase); base if there is none."""
+    commits = git("rev-list", "--reverse", "--no-merges", f"{base}..{head}").split()
+    return commits[0] if commits else base
+
+
 def gh_base(ref):
     """GitHub branch name for a local ref name such as origin/main or refs/remotes/origin/main."""
     for prefix in ("refs/remotes/origin/", "refs/heads/", "origin/"):
@@ -557,7 +609,10 @@ def branch_state(plan, merged=frozenset()):
             info["drift"] = sorted(((p, plan.pr_of(p)) for p in info["stats"] if plan.pr_of(p) != n),
                                    key=lambda x: x[0])
         out[n] = info
-        below = plan.base if n in merged else (head or below)
+        if n in merged and (not head or is_ancestor(head, plan.base)):
+            below = plan.base  # merged with its commits: the next PR is measured from the base
+        else:
+            below = head or below  # open, or squash-merged (restack pending): keep the branch as the base
     return out
 
 
@@ -633,13 +688,15 @@ def next_steps(plan, state, gh):
     steps, merged = [], merged_set(gh)
     lowest_open = min((pr["n"] for pr in plan.prs if pr["n"] not in merged), default=None)
     for n in sorted(merged):
-        if any(m not in merged and m in gh for m in range(1, n)):
+        if any(m not in merged for m in range(1, n)):
             steps.append(f"PR {n:02d} merged while a lower PR is still open: wrong merge order; the base now holds "
                          f"PR {n:02d}'s layer without the one below. Check the base before merging anything else.")
         head = state[n]["head"]
         if head and not is_ancestor(head, plan.base):
+            nxt = next((m for m in range(n + 1, len(plan.prs) + 1) if m not in merged), None)
             steps.append(f"PR {n:02d} was squash- or rebase-merged (its commits are not in `{plan.base}`; fetch first "
-                         f"if unsure) → `restack --from {n + 1}`, then `publish --force`.")
+                         "if unsure)" + (f" → `restack --from {nxt}`, then `publish --force`." if nxt else
+                                         "; nothing above it to restack."))
         elif state[n]["local"]:
             steps.append(f"PR {n:02d} merged → delete the local branch when done: `git branch -d {plan.prs[n - 1]['branch']}`.")
     for pr in plan.prs:
@@ -707,7 +764,8 @@ def context(plan, with_gh):
         else:
             stats, (a, b) = {p: plan.changed[p] for p in plan.files_of(n)}, (plan.fork, plan.source_sha)
         layer_stats[n] = stats
-        changes[n] = describe(stats, read_blobs(a, stats), read_blobs(b, stats))
+        olds = [*stats, *(RENAMED[p] for p in stats if p in RENAMED)]
+        changes[n] = describe(stats, read_blobs(a, olds), read_blobs(b, stats))
     needs = collections.defaultdict(lambda: collections.defaultdict(set))  # pr -> other pr -> {symbol}
     used_by = collections.defaultdict(set)
     for a, b, what, _ in edges:
@@ -771,10 +829,10 @@ def render_card(plan, ctx, pr, heading="###"):
 
 
 BODY_START, BODY_END = "<!-- stacked-prs:start -->", "<!-- stacked-prs:end -->"
-BODY_LIMIT = 60000
+BODY_LIMIT = 65000  # GitHub allows 65536 characters per description
 
 
-def render_body(plan, ctx, pr):
+def render_body(plan, ctx, pr, limit=BODY_LIMIT):
     """The generated part of a PR description: the stack (with this PR marked) and this PR's card."""
     rows = []
     for other in plan.prs:
@@ -786,8 +844,8 @@ def render_body(plan, ctx, pr):
     L = [BODY_START, f"**Stacked PR {pr['n']} of {len(plan.prs)}.** Review only this PR's diff; it is based on the PR "
          "below it in this list. Merge bottom-up.", "", *rows, "", *render_card(plan, ctx, pr, "####"), BODY_END]
     body = "\n".join(L)
-    if len(body) > BODY_LIMIT:
-        body = body[:BODY_LIMIT - 200] + "\n\n_(cut to fit GitHub's limit; the stack document has the full card)_\n" \
+    if len(body) > limit:
+        body = body[:max(limit - 200, 0)] + "\n\n_(cut to fit GitHub's limit; the stack document has the full card)_\n" \
                + BODY_END
     return body
 
@@ -795,9 +853,17 @@ def render_body(plan, ctx, pr):
 def merge_body(old, generated):
     """Replace the generated block in an existing PR description, keeping everything the author wrote around it."""
     old = old or ""
-    if BODY_START in old and BODY_END in old:
-        return old[:old.index(BODY_START)] + generated + old[old.index(BODY_END) + len(BODY_END):]
+    start = old.find(BODY_START)
+    end = old.find(BODY_END, start + len(BODY_START)) if start >= 0 else -1
+    if start >= 0 and end >= 0:
+        return old[:start] + generated + old[end + len(BODY_END):]
     return (old.rstrip() + "\n\n" if old.strip() else "") + generated
+
+
+def fitted_body(plan, ctx, pr, old):
+    """The full new description (author text kept) within GitHub's limit."""
+    room = BODY_LIMIT - len(merge_body(old, BODY_START + BODY_END)) - 100
+    return merge_body(old, render_body(plan, ctx, pr, limit=room))
 
 
 # ---------- subcommands ----------
@@ -1010,7 +1076,7 @@ def cmd_publish(args):
     state, gh, merged = ctx["state"], ctx["gh"], ctx["merged"]
     if not state:
         sys.exit("nothing is cut yet")
-    pushes, creates, retargets, problems_ = [], [], [], []
+    pushes, creates, retargets, problems_, skipped = [], [], [], [], []
     for pr in plan.prs:
         n, s, g = pr["n"], state[pr["n"]], gh.get(pr["n"])
         if n in merged:
@@ -1034,7 +1100,7 @@ def cmd_publish(args):
         elif g["state"] == "OPEN" and g["baseRefName"] != want:
             retargets.append((pr, g, want))
         elif g["state"] == "CLOSED":
-            problems_.append(f"PR {n:02d}: #{g['number']} is closed; reopen it by hand")
+            skipped.append(f"PR {n:02d}: #{g['number']} is closed; reopen it by hand (left alone)")
     print("Push:", *(f"  {p['branch']}{' (force-with-lease)' if f else ''}" for p, f in pushes) or ["  nothing"],
           sep="\n")
     print("Open PRs:", *(f"  {p['branch']} → base {b}{' (draft)' if args.draft else ''}" for p, b in creates)
@@ -1042,6 +1108,8 @@ def cmd_publish(args):
     print("Fix base:", *(f"  #{g['number']} {g['baseRefName']} → {b}" for p, g, b in retargets) or ["  none"],
           sep="\n")
     print(f"Refresh the generated block in every open PR description ({len(plan.prs) - len(merged)} PRs).")
+    if skipped:
+        print("Skipped:", *(f"  {x}" for x in skipped), sep="\n")
     if problems_:
         print("Blocked:", *(f"  {x}" for x in problems_), sep="\n")
         return 1
@@ -1068,7 +1136,7 @@ def cmd_publish(args):
         g = ctx["gh"].get(pr["n"])
         if not g or g["state"] != "OPEN":
             continue
-        body = merge_body(g.get("body"), render_body(plan, ctx, pr))
+        body = fitted_body(plan, ctx, pr, g.get("body"))
         if body != g.get("body"):
             subprocess.run(["gh", "pr", "edit", str(g["number"]), "--body", body], check=True, capture_output=True)
             print(f"#{g['number']} description refreshed")
@@ -1088,7 +1156,7 @@ def cmd_cut(args):
         for pr in plan.prs:
             git("read-tree", parent, env=env)
             for p in plan.files_of(pr["n"]):
-                entry = git("ls-tree", plan.source, "--", p).strip()
+                entry = git("ls-tree", plan.source, "--", f":(literal){p}").strip()
                 if entry:
                     mode, _, sha = entry.split("\t")[0].split()
                     git("update-index", "--add", "--cacheinfo", f"{mode},{sha},{p}", env=env)
@@ -1101,8 +1169,9 @@ def cmd_cut(args):
             print(f"{pr['n']:02d} {pr['branch']} {parent[:10]}")
     save_cut(plan, dict(date=f"{datetime.datetime.now():%Y-%m-%d %H:%M}", source=plan.source_sha, fork=plan.fork,
                         branches=heads))
-    rest = git("diff", "--stat", parent, plan.source, "--", ".", *[f":!{x}" for x in plan.exclude]).strip()
-    print("top branch == source (excluded paths aside)" if not rest else f"MISMATCH between top and source:\n{rest}")
+    rest = [p for p in git("diff", "--name-only", "-z", parent, plan.source).split("\0") if p and plan.pr_of(p) is not None]
+    print("top branch == source (excluded paths aside)" if not rest else
+          "MISMATCH between top and source:\n  " + "\n  ".join(rest))
 
 
 def save_cut(plan, data):
@@ -1143,21 +1212,34 @@ def cmd_restack(args):
         print("\nDry run. Show this to the user; re-run with --yes only on their go. Afterwards: `publish --force`.")
         return 0
     cut = plan.cut or dict(date="", source=plan.source_sha, fork=plan.fork, branches={})
+    cut.setdefault("pending_restack", {})
+    stack_paths = set(git("diff", "--name-only", "-z", plan.fork, olds[len(plan.prs)] if len(plan.prs) in olds
+                          else ref_of(plan.prs[-1]["branch"])).split("\0")) - {""}
     prev_old, prev_new = old_base, git("rev-parse", onto).strip()
     for pr in plan.prs[start - 1:]:
         path = worktree(pr["branch"])
         r = subprocess.run(["git", "rebase", "--onto", prev_new, prev_old], cwd=path, capture_output=True, text=True)
         if r.returncode:
+            cut["pending_restack"][pr["branch"]] = prev_new  # settled automatically once the rebase is finished
+            save_cut(plan, cut)
+            later = (f"then run: restack --from {pr['n'] + 1} --old-base {olds[pr['n']]} --onto {pr['branch']} --yes"
+                     if pr["n"] < len(plan.prs) else "and the restack is complete")
             sys.exit(f"conflict restacking {pr['branch']} in {path}. Resolve, `git rebase --continue` there, "
-                     f"`git worktree remove {path}`, then run: restack --from {pr['n'] + 1} --old-base "
-                     f"{olds[pr['n']]} --onto {pr['branch']} --yes")
+                     f"`git worktree remove {path}`, {later}")
         new = git("-C", path, "rev-parse", "HEAD").strip()
         git("worktree", "remove", path)
-        cut["branches"][pr["branch"]] = prev_new  # own commits are counted from the new base
+        cut["branches"][pr["branch"]] = first_commit(prev_new, new)
+        cut["restacked"] = f"{datetime.datetime.now():%Y-%m-%d %H:%M}"
+        save_cut(plan, cut)
         print(f"{pr['n']:02d} {pr['branch']}: {olds[pr['n']][:10]} → {new[:10]}")
+        # rebase replays only the branch's own commits: a conflict fix that lived in a sync merge commit is dropped
+        # silently. Compare content: with the base holding exactly the merged layer, nothing in the stack may change.
+        moved = [x for x in git("diff", "--name-only", "-z", olds[pr["n"]], new).split("\0") if x in stack_paths]
+        if moved:
+            print(f"   ⚠ content differs from before the restack in: {short(moved, 8)}. Expected only if the base "
+                  "brought other changes to these files; otherwise a resolution from a sync merge was lost — "
+                  f"compare `git diff {olds[pr['n']][:10]} {new[:10]}`.")
         prev_old, prev_new = olds[pr["n"]], new
-    cut["restacked"] = f"{datetime.datetime.now():%Y-%m-%d %H:%M}"
-    save_cut(plan, cut)
     print("Branches rewritten. Next: `publish --force` (dry run first).")
     return 0
 
