@@ -1243,7 +1243,8 @@ def cmd_publish(args):
     if linkable and open_prs:
         numbers = [ctx["gh"][pr["n"]]["number"] for pr in open_prs if pr["n"] in ctx["gh"]]
         link_stack(plan, numbers, stack_base)
-        ctx = context(Plan(args.plan), True)
+        plan = Plan(args.plan)  # the relink may have created a new stack number
+        ctx = context(plan, True)
     for pr in plan.prs:
         g = ctx["gh"].get(pr["n"])
         if not g or g["state"] != "OPEN":
